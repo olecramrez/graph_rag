@@ -65,6 +65,8 @@ from src.config import (
 
 from src.rag_pipeline import ask, ask_multi_base, DEFAULT_PROMPT_TEMPLATE
 from src.cnpj_query import answer_cnpj_query, is_cnpj_query
+from src.anm_query import answer_anm_query
+from src.command_router import parse_route_command
 from src.lia_client import LIAClientError, chat_completion
 from src.safe_jsonl import load_valid_jsonl
 from src.positional_index import load_positional_index, search
@@ -1295,7 +1297,7 @@ def join_hybrid_outputs(cnpj_output, rag_output):
     )
 
 
-ALLOWED_SEARCH_ROUTES = {"cnpj_only", "rag_only", "cnpj_rag_hybrid", "rag_cnpj_hybrid"}
+ALLOWED_SEARCH_ROUTES = {"cnpj_only", "anm_only", "rag_only", "cnpj_rag_hybrid", "rag_cnpj_hybrid"}
 
 
 def fallback_search_route(query):
@@ -1367,6 +1369,18 @@ def sanitize_search_route(payload, query):
 
 
 def choose_search_route(query, llm_model=None, progress_callback=None):
+    command_route, command_query = parse_route_command(query)
+    if command_route:
+        route = {
+            "route": f"{command_route}_only",
+            "reason": f"Comando explicito @{command_route}.",
+            "rag_query": command_query or str(query or "").strip(),
+            "source": "command",
+        }
+        if progress_callback:
+            progress_callback(f"[INFO] Roteador por comando: {route['route']} - {route['reason']}")
+        return route
+
     fallback = fallback_search_route(query)
 
     prompt = f"""
@@ -3423,7 +3437,10 @@ with main_col:
         )
         route_name = search_route.get("route") or "rag_only"
         routed_rag_query = search_route.get("rag_query") or query_for_rag
-        if routed_rag_query != query_for_rag:
+        original_query_for_log = query_for_rag
+        if search_route.get("source") == "command":
+            query_for_rag = routed_rag_query or query_for_rag
+        if search_route.get("source") != "command" and routed_rag_query != original_query_for_log:
             on_timing(f"[QUERY][ROUTER] Consulta RAG sugerida: {_short_log_text(routed_rag_query)}")
 
         try:
@@ -3559,6 +3576,19 @@ with main_col:
                 resposta_completa, reranked, routing = answer_cnpj_query(
                     query_for_rag,
                     llm_model=final_llm_model,
+                    progress_callback=on_timing,
+                )
+                routing["route_source"] = search_route.get("source")
+                routing["route_reason"] = search_route.get("reason")
+            elif route_name == "anm_only":
+                if status_box is not None:
+                    status_box.write(
+                        ":blue[[INFO] Pergunta roteada para base ANM SQLite.]"
+                    )
+                on_timing("[INFO] Consulta ANM SQLite")
+                on_timing(f"[QUERY][ANM] {_short_log_text(query_for_rag)}")
+                resposta_completa, reranked, routing = answer_anm_query(
+                    query_for_rag,
                     progress_callback=on_timing,
                 )
                 routing["route_source"] = search_route.get("source")

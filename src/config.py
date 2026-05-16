@@ -324,3 +324,48 @@ def get_cnpj_db_path():
         except OSError:
             continue
     return get_persistent_data_dir("cnpj") / "cnpj.sqlite"
+
+
+def get_anm_db_candidates():
+    candidates = []
+
+    env_path = (os.getenv("ANM_SQLITE_PATH") or os.getenv("ANM_DADOS_GOV_SQLITE_PATH") or "").strip()
+    if env_path:
+        path = Path(env_path)
+        if not path.is_absolute():
+            path = PROJECT_ROOT / path
+        candidates.append(path)
+
+    anm_data_dir = get_persistent_data_dir("anm_dados_gov")
+    candidates.extend(
+        [
+            anm_data_dir / "anm_dados_gov.sqlite",
+            PROJECT_ROOT / "data_anm" / "anm_dados_gov.sqlite",
+            PROJECT_ROOT / "data_anm" / "anm.sqlite",
+        ]
+    )
+
+    for root in (anm_data_dir, PROJECT_ROOT / "data_anm"):
+        try:
+            candidates.extend(sorted(root.glob("*.sqlite"), reverse=True))
+        except OSError:
+            pass
+
+    unique = []
+    seen = set()
+    for path in candidates:
+        key = str(path).lower()
+        if key not in seen:
+            seen.add(key)
+            unique.append(path)
+    return unique
+
+
+def get_anm_db_path():
+    for path in get_anm_db_candidates():
+        try:
+            if path.exists():
+                return path
+        except OSError:
+            continue
+    return get_persistent_data_dir("anm_dados_gov") / "anm_dados_gov.sqlite"

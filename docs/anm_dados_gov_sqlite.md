@@ -82,3 +82,21 @@ Dados importados:
 
 Formatos nao tabulares ficam baixados e registrados em `resources`, mas nao viram
 tabela de dados.
+
+## Consultas no app
+
+O chat aceita prefixos explicitos para evitar erro de roteamento:
+
+```text
+@cnpj 00.788.023/0001-02 socios
+@anm quais recursos de CFEM foram importados?
+@anm amostra da tabela CFEM
+@rag quais normas tratam de barragens?
+```
+
+`@anm` consulta o SQLite criado por este importador. Se o arquivo estiver fora do
+caminho padrao, defina:
+
+```powershell
+$env:ANM_SQLITE_PATH = "Z:\Graph_rag\anm_sqlite\anm_dados_gov.sqlite"
+```
