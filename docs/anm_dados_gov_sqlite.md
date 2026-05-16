@@ -6,9 +6,13 @@ tabelas SQLite.
 
 ## Token
 
-Em 2026-05-16, os endpoints do portal retornaram `401` sem token `Bearer`.
-Gere um token de consumidor no perfil do dados.gov.br e informe por variavel de
-ambiente:
+Em 2026-05-16, os endpoints JSON do `dados.gov.br` retornaram `401` sem token
+`Bearer`. O script funciona sem token usando a fonte oficial direta da ANM
+(`https://dadosabertos.anm.gov.br`). Com token, ele tenta primeiro o catalogo do
+`dados.gov.br`.
+
+Para usar o catalogo do `dados.gov.br`, gere um token de consumidor no perfil do
+portal e informe por variavel de ambiente:
 
 ```powershell
 $env:DADOS_GOV_BR_TOKEN = "SEU_TOKEN"
@@ -21,6 +25,15 @@ python tools\download_anm_dados_gov_to_sqlite.py --token "SEU_TOKEN"
 ```
 
 ## Uso principal
+
+Sem token:
+
+```powershell
+python tools\download_anm_dados_gov_to_sqlite.py --source anm-direct
+```
+
+Modo automatico: tenta `dados.gov.br`; se receber `401`, cai para
+`dadosabertos.anm.gov.br`.
 
 ```powershell
 python tools\download_anm_dados_gov_to_sqlite.py --fetch-details
@@ -50,7 +63,7 @@ python tools\download_anm_dados_gov_to_sqlite.py --metadata-only --max-pages 1
 Para testar importacao sem carregar bases inteiras:
 
 ```powershell
-python tools\download_anm_dados_gov_to_sqlite.py --max-pages 1 --max-rows 1000
+python tools\download_anm_dados_gov_to_sqlite.py --source anm-direct --max-dirs 3 --max-rows 1000
 ```
 
 ## Estrutura do SQLite

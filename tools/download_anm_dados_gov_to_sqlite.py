@@ -1,6 +1,7 @@
 import argparse
 import csv
 import hashlib
+import html
 import io
 import json
 import os
@@ -11,7 +12,7 @@ import time
 import zipfile
 from datetime import datetime, timezone
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import pandas as pd
 import requests
@@ -25,6 +26,7 @@ from src.config import get_persistent_data_dir
 
 
 BASE_URL = "https://dados.gov.br"
+ANM_OPEN_DATA_URL = "https://dadosabertos.anm.gov.br/"
 SEARCH_ENDPOINT = "/api/publico/conjuntos-dados/buscar"
 DETAIL_ENDPOINTS = (
     "/api/publico/conjuntos-dados/{id}",
@@ -33,6 +35,7 @@ DETAIL_ENDPOINTS = (
 )
 DEFAULT_USER_AGENT = "graph-rag-anm-importer/1.0"
 SUPPORTED_TABULAR_FORMATS = {"csv", "txt", "tsv", "xlsx", "xls", "json", "geojson", "parquet"}
+SKIP_DIRECT_EXTENSIONS = {"aspx", "html", "htm"}
 
 
 class DadosGovAuthError(RuntimeError):
@@ -120,6 +123,23 @@ def request_json(session, url, params=None, timeout=60, retries=3):
             last_exc = exc
             if isinstance(exc, DadosGovAuthError):
                 break
+            if attempt == retries:
+                break
+            time.sleep(min(2 * attempt, 8))
+    raise last_exc
+
+
+def request_text(session, url, timeout=60, retries=3):
+    last_exc = None
+    for attempt in range(1, retries + 1):
+        try:
+            response = session.get(url, timeout=timeout)
+            response.raise_for_status()
+            if not response.encoding:
+                response.encoding = response.apparent_encoding or "utf-8"
+            return response.text
+        except Exception as exc:
+            last_exc = exc
             if attempt == retries:
                 break
             time.sleep(min(2 * attempt, 8))
@@ -262,6 +282,124 @@ def search_datasets(session, query, page_size=100, max_pages=None, dados_abertos
             break
 
 
+def parse_directory_index(html_text, base_url):
+    links = []
+    for match in re.finditer(r"<a\s+[^>]*href=[\"']([^\"']+)[\"'][^>]*>(.*?)</a>", html_text, flags=re.I | re.S):
+        href = html.unescape(match.group(1)).strip()
+        label = re.sub(r"<[^>]+>", "", match.group(2))
+        label = html.unescape(clean_text(label))
+        if not href or href.startswith("#") or href.startswith("?"):
+            continue
+        if href in {"../", "/"} or label.lower() in {"to parent directory", "parent directory", "../"}:
+            continue
+        absolute = urljoin(base_url, href)
+        parsed = urlparse(absolute)
+        if parsed.scheme not in {"http", "https"}:
+            continue
+        is_dir = href.endswith("/") or label.endswith("/")
+        links.append({"url": absolute, "name": label.strip("/") or Path(parsed.path).name, "is_dir": is_dir})
+    return links
+
+
+def direct_resource_from_url(url, name, dataset):
+    suffix = Path(urlparse(url).path).suffix.lower().strip(".")
+    return {
+        "id": hashlib.sha1(url.encode("utf-8")).hexdigest(),
+        "name": name or Path(urlparse(url).path).name,
+        "description": f"Arquivo publicado em diretorio aberto da ANM: {dataset.get('title')}",
+        "format": suffix,
+        "url": url,
+        "mimetype": "",
+        "size": None,
+    }
+
+
+def crawl_anm_open_data(session, root_url=ANM_OPEN_DATA_URL, max_depth=6, max_dirs=None):
+    queue = [(root_url.rstrip("/") + "/", 0)]
+    visited = set()
+    yielded = 0
+
+    while queue:
+        url, depth = queue.pop(0)
+        key = url.lower()
+        if key in visited:
+            continue
+        visited.add(key)
+        if max_dirs and len(visited) > max_dirs:
+            break
+
+        page = request_text(session, url)
+        links = parse_directory_index(page, url)
+        files = []
+        for link in links:
+            if link["is_dir"]:
+                if depth < max_depth:
+                    queue.append((link["url"].rstrip("/") + "/", depth + 1))
+                continue
+            suffix = Path(urlparse(link["url"]).path).suffix.lower().strip(".")
+            if suffix in SKIP_DIRECT_EXTENSIONS:
+                continue
+            files.append(link)
+
+        if not files:
+            continue
+
+        parsed = urlparse(url)
+        parts = [part for part in parsed.path.strip("/").split("/") if part]
+        dataset_name_value = "_".join(parts) if parts else "anm_dados_abertos"
+        title = "ANM Dados Abertos - " + (" / ".join(parts) if parts else "raiz")
+        dataset = {
+            "id": hashlib.sha1(url.encode("utf-8")).hexdigest(),
+            "name": dataset_name_value,
+            "title": title,
+            "notes": f"Diretorio aberto oficial da ANM: {url}",
+            "organization": {
+                "id": "anm",
+                "name": "agencia-nacional-de-mineracao",
+                "title": "Agencia Nacional de Mineracao - ANM",
+            },
+            "source_url": url,
+            "resources": [],
+        }
+        dataset["resources"] = [
+            direct_resource_from_url(link["url"], link["name"], dataset)
+            for link in files
+        ]
+        yielded += 1
+        yield dataset
+
+
+def iter_catalog_datasets(session, args):
+    source = args.source
+    if source == "anm-direct":
+        yield from crawl_anm_open_data(
+            session,
+            root_url=args.anm_open_data_url,
+            max_depth=args.max_depth,
+            max_dirs=args.max_dirs,
+        )
+        return
+
+    try:
+        yield from search_datasets(
+            session,
+            args.query,
+            page_size=args.page_size,
+            max_pages=args.max_pages,
+            dados_abertos=None if args.include_non_open else True,
+        )
+    except DadosGovAuthError:
+        if source == "dados-gov":
+            raise
+        print("[WARN] dados.gov.br exige token. Usando fonte direta oficial da ANM sem autenticacao.")
+        yield from crawl_anm_open_data(
+            session,
+            root_url=args.anm_open_data_url,
+            max_depth=args.max_depth,
+            max_dirs=args.max_dirs,
+        )
+
+
 def dataset_id(dataset):
     return clean_text(dataset.get("id") or dataset.get("name") or dataset.get("nome") or dataset.get("nomeConjuntoDados"))
 
@@ -371,7 +509,7 @@ def upsert_dataset(conn, dataset):
             org["organization_title"],
             clean_text(dataset.get("metadata_created") or dataset.get("dataCriacao")),
             clean_text(dataset.get("metadata_modified") or dataset.get("dataUltimaAtualizacaoDados")),
-            f"{BASE_URL}/dados/conjuntos-dados/{dataset_name(dataset)}",
+            clean_text(dataset.get("source_url")) or f"{BASE_URL}/dados/conjuntos-dados/{dataset_name(dataset)}",
             safe_json(dataset),
         ),
     )
@@ -646,14 +784,8 @@ def run(args):
         resources_found = 0
         resources_imported = 0
 
-        print(f"[INFO] Buscando conjuntos no dados.gov.br: query={args.query!r}")
-        for raw_dataset in search_datasets(
-            session,
-            args.query,
-            page_size=args.page_size,
-            max_pages=args.max_pages,
-            dados_abertos=None if args.include_non_open else True,
-        ):
+        print(f"[INFO] Descobrindo conjuntos: source={args.source} query={args.query!r}")
+        for raw_dataset in iter_catalog_datasets(session, args):
             if args.only_anm and not is_anm_dataset(raw_dataset):
                 continue
             ident = dataset_id(raw_dataset) or dataset_name(raw_dataset)
@@ -707,11 +839,24 @@ def parse_args():
     )
     parser.add_argument("--query", default="anm", help="Termo de busca no catalogo do dados.gov.br.")
     parser.add_argument("--token", default=None, help="Token Bearer do dados.gov.br. Alternativa: DADOS_GOV_BR_TOKEN.")
+    parser.add_argument(
+        "--source",
+        choices=("auto", "dados-gov", "anm-direct"),
+        default="auto",
+        help="Fonte de descoberta. auto usa dados.gov.br quando autorizado e cai para dadosabertos.anm.gov.br sem token.",
+    )
+    parser.add_argument(
+        "--anm-open-data-url",
+        default=ANM_OPEN_DATA_URL,
+        help="Raiz do diretorio aberto oficial da ANM para modo sem token.",
+    )
     parser.add_argument("--db-path", default=None, help="Caminho do SQLite final.")
     parser.add_argument("--output-dir", default=None, help="Diretorio base para SQLite e arquivos baixados.")
     parser.add_argument("--files-dir", default=None, help="Diretorio para downloads dos recursos.")
     parser.add_argument("--page-size", type=int, default=100, help="Tamanho da pagina na API.")
     parser.add_argument("--max-pages", type=int, default=None, help="Limite opcional de paginas para teste.")
+    parser.add_argument("--max-depth", type=int, default=6, help="Profundidade maxima no crawler direto da ANM.")
+    parser.add_argument("--max-dirs", type=int, default=None, help="Limite opcional de diretorios no crawler direto da ANM.")
     parser.add_argument("--max-rows", type=int, default=None, help="Limite opcional de linhas por recurso para teste.")
     parser.add_argument("--fetch-details", action="store_true", help="Busca detalhe de cada dataset antes de importar recursos.")
     parser.add_argument("--include-non-open", action="store_true", help="Inclui conjuntos nao marcados como dados abertos.")
