@@ -1,0 +1,120 @@
+GUIA DE USO - INDEXACAO (2 MODOS)
+
+Objetivo
+- Indexar PDFs direto da rede, com retomada por checkpoint.
+- Artefatos persistentes ficam na rede:
+  chunks.jsonl, bm25.pkl, id_map.json, positional_index.pkl, registry.json.
+- O faiss.index final fica na rede ao concluir com sucesso.
+
+Ambiente desta instalacao
+- Projeto: Z:\RAG_Compartilhado\rag_compartilhado
+- Dados na rede: Z:\RAG_Compartilhado\base_rag\data
+
+
+========================================
+MODO 1 - REDE (index.py)
+========================================
+Quando usar
+- Quando voce quer que o FAISS de trabalho fique na rede.
+- Bom para reduzir uso de disco local (C:).
+
+Comando (base especifica - exemplo Atos_normativos)
+  $env:RAG_FAISS_WORK_ROOT = "Z:\RAG_Compartilhado\base_rag\data"
+  New-Item -ItemType Directory -Force -Path $env:RAG_FAISS_WORK_ROOT | Out-Null
+  python index.py --base Atos_normativos --checkpoint-batches 25 --batch-retries 8 --retry-wait-seconds 20
+
+Comando (todas as bases)
+  $env:RAG_FAISS_WORK_ROOT = "Z:\RAG_Compartilhado\base_rag\data"
+  New-Item -ItemType Directory -Force -Path $env:RAG_FAISS_WORK_ROOT | Out-Null
+  python index.py --all --checkpoint-batches 25 --batch-retries 8 --retry-wait-seconds 20
+
+Observacoes
+- Evite Resolve-Path se a pasta ainda nao existir.
+- A variavel RAG_FAISS_WORK_ROOT vale para a sessao atual do PowerShell.
+
+
+========================================
+MODO 2 - C: (index2.py)
+========================================
+Quando usar
+- Quando a rede estiver instavel para escrita do FAISS de trabalho.
+- Quando voce quer continuar no C: mesmo apos problemas no modo rede.
+
+Comando (base especifica - exemplo Atos_normativos)
+  python index2.py --base Atos_normativos --checkpoint-batches 25 --batch-retries 8 --retry-wait-seconds 20
+
+Comando (todas as bases)
+  python index2.py --all --checkpoint-batches 25 --batch-retries 8 --retry-wait-seconds 20
+
+Observacoes
+- O index2.py ignora RAG_FAISS_WORK_ROOT.
+- O index2.py desativa fallback de FAISS de trabalho na rede.
+
+
+========================================
+PARAMETROS IMPORTANTES (AMBOS)
+========================================
+- --checkpoint-batches N
+  Salva checkpoint do FAISS a cada N batches.
+  Menor N = mais resiliencia, mais escrita.
+  Maior N = menos escrita, mais risco de retrabalho apos queda.
+
+- --batch-retries N
+  Numero maximo de tentativas por batch FAISS em caso de erro.
+
+- --retry-wait-seconds N
+  Tempo de espera entre tentativas de retry.
+
+Padroes atuais
+- checkpoint-batches: 100
+- batch-retries: 5
+- retry-wait-seconds: 30
+
+
+========================================
+COMO LER O PROGRESSO
+========================================
+- Chunks:
+  [PROGRESS] documento X/Y (Z%) | nome.pdf
+- FAISS:
+  [PROGRESS] batch X/Y (Z%)
+
+
+========================================
+RETOMADA APOS QUEBRA
+========================================
+Se quebrar (erro, queda de rede, etc.):
+1) Rode novamente o MESMO comando do modo escolhido.
+2) O sistema retoma pelos checkpoints.
+
+Sobre Ctrl+C
+- Ctrl+C para o processo imediatamente.
+- A retomada ocorre no proximo run manual.
+
+Arquivos de estado que NAO devem ser apagados durante retomada:
+- chunks.jsonl
+- id_map.json
+- chunk_checkpoint.json
+- faiss.index (ou faiss.work.index, quando aplicavel)
+
+
+========================================
+TROCAR ENTRE MODOS
+========================================
+De REDE para C:
+  Remove-Item Env:RAG_FAISS_WORK_ROOT -ErrorAction SilentlyContinue
+  python index2.py --base Atos_normativos
+
+De C para REDE:
+  $env:RAG_FAISS_WORK_ROOT = "Z:\RAG_Compartilhado\base_rag\data"
+  python index.py --base Atos_normativos
+
+
+========================================
+CONFIGURACAO RECOMENDADA
+========================================
+- Ambiente estavel:
+  --checkpoint-batches 100 --batch-retries 5 --retry-wait-seconds 30
+
+- Ambiente instavel:
+  --checkpoint-batches 25 --batch-retries 8 --retry-wait-seconds 20

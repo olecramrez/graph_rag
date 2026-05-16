@@ -1,0 +1,54 @@
+# Python/runtime
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Local environment and credentials
+.env
+.env.*
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+
+# Logs and local outputs
+*.log
+logs/
+logs_indexacao/
+reports/
+
+# Local data, indexes, databases, and generated corpora
+data/
+*.sqlite
+*.sqlite3
+*.db
+*.duckdb
+*.faiss
+*.pkl
+*.pickle
+*.parquet
+*.zip
+sr2/extracao_anm_completa/
+sr2/extracao_legislacao_mineracao/
+sr2/extracao_referencias_ausentes/
+sr2/probe_estruturantes/
+sr2/probe_pagination/
+sr2/metadados_consolidados.*
+sr2/relatorio_referencias_ausentes*.csv
+
+# Generated spreadsheets and local shortcuts
+*.xlsx
+*.xls
+*.lnk
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+desktop.ini

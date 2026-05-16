@@ -1,0 +1,57 @@
+Setup:
+1- Abra um terminal no vscode
+2- Rode o código:
+python setup_user.py
+3- Edite o novo .env e coloque sua chave.
+C:\Users\vitorpa\rag_multi_vitor\.env
+
+
+Criar atalho:
+1- Vá para a Área de Trabalho
+2- Clique com botão direito - Novo - Atalho
+3- No campo "Local do item", cole exatamente:
+powershell -ExecutionPolicy Bypass -File "Z:\Descomissionamento EP\rag_multi_vitor\run_rag.ps1"
+4- Clique em Avançar.
+5- Nomeie como:
+RAG fulano
+Clique em Concluir.
+
+Indexar pelo VSCode:
+1- Abra um terminal no vscode
+2- ative o ambiente virtual:
+C:\Users\marcelorezende\rag_fulano\Scripts\Activate.ps1
+Indexar todas as bases: python index.py --all
+Indexar base específica: python index.py --base xyz, onde xyz é o nome da pasta (ex: xxxxxxx-ibama)
+
+Rodar app direto do terminal:
+powershell -ExecutionPolicy Bypass -File .\run_rag.ps1
+
+Editar prompt padrão:
+Edite no código src/rag_pipeline.py, no bloco: 
+# =====================================================
+# PROMPT PADRÃO
+# =====================================================
+No final, de um control+S para salvar.
+
+Editar o número de evidências que aparece na resposta:
+Edite no código src/rag_pipeline.py, no bloco:
+# =====================================================
+# BUILD EVIDENCE
+# =====================================================
+for score, chunk in results[:12]: (atualmente está com 12 evidências)
+No final, de um control+S para salvar.
+
+Editar lista de sinônimos: (pode formar sinônimos de palavras relacionadas ao tipo de trabalho para expandir as buscas)
+
+Edite no código src/rag_pipeline.py, no bloco:
+# =====================================================
+# QUERY EXPANSION
+# =====================================================
+expansions = {
+        "parcialidade": "parcialidade favorecimento conflito de interesse tratamento desigual",
+        "divergência": "divergência contradição discordância diferença entendimento distinto",
+        "risco": "risco impacto perigo ameaça dano potencial",
+        "irregularidade": "irregularidade falha inconsistência problema desconformidade",
+    }
+A IA pode montar listas relacionadas com o tema.
+No final, de um control+S para salvar.
