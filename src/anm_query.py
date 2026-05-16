@@ -1,14 +1,27 @@
 import re
 import sqlite3
+import unicodedata
 from pathlib import Path
 
 from src.config import get_anm_db_path
 from src.cnpj_query import _md_table
-from src.sql_agent import answer_sql_agent_query, discover_sqlite_schema
+from src.sql_agent import answer_sql_agent_query, discover_sqlite_schema, quote_identifier
+
+
+RESOURCE_STOPWORDS = {
+    "anm", "recurso", "recursos", "tabela", "tabelas", "base", "bases",
+    "listar", "liste", "mostre", "mostrar", "quais", "qual", "foram",
+    "foi", "sao", "são", "existem", "existe", "importado", "importados",
+    "importada", "importadas", "dados", "dado", "por", "para", "com",
+    "dos", "das", "uma", "uns", "nas", "nos", "total", "ranking",
+    "municipio", "município", "municipios", "municípios", "valor",
+}
 
 
 def _normalize(text):
-    return re.sub(r"\s+", " ", str(text or "").lower()).strip()
+    normalized = unicodedata.normalize("NFKD", str(text or ""))
+    normalized = "".join(ch for ch in normalized if not unicodedata.combining(ch))
+    return re.sub(r"\s+", " ", normalized.lower()).strip()
 
 
 def _connect(db_path=None):
@@ -47,6 +60,10 @@ def _list_data_tables(conn, limit=50):
 def _count_table(conn, table_name):
     quoted = '"' + table_name.replace('"', '""') + '"'
     return conn.execute(f"SELECT COUNT(*) AS total FROM {quoted}").fetchone()["total"]
+
+
+def _column_names(conn, table_name):
+    return [row["name"] for row in conn.execute(f"PRAGMA table_info({quote_identifier(table_name)})").fetchall()]
 
 
 def _format_resources(rows):
@@ -107,6 +124,42 @@ def _answer_schema(conn, limit=80):
     return _md_table(["Tabela", "Descricao", "Colunas", "Primeiras colunas"], rows)
 
 
+def _answer_imported_tables(conn, limit=80):
+    data_tables = _list_data_tables(conn, limit=limit)
+    data_rows = [[name, _count_table(conn, name), ", ".join(_column_names(conn, name)[:10])] for name in data_tables]
+    if data_rows:
+        return "Tabelas de dados importadas:\n\n" + _md_table(["Tabela", "Linhas", "Primeiras colunas"], data_rows)
+
+    if not _table_exists(conn, "resources"):
+        return "Nao encontrei a tabela `resources` para verificar importacao."
+
+    resources = conn.execute(
+        """
+        SELECT
+            d.title AS dataset_title,
+            r.name,
+            r.format,
+            r.table_name,
+            r.imported_rows,
+            r.url
+        FROM resources r
+        LEFT JOIN datasets d ON d.id = r.dataset_id
+        WHERE r.table_name IS NOT NULL OR COALESCE(r.imported_rows, 0) > 0
+        ORDER BY d.title, r.name
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    if resources:
+        return "Recursos marcados como importados:\n\n" + _format_resources(resources)
+
+    return (
+        "Ainda nao ha tabelas de dados importadas no SQLite ANM.\n\n"
+        "Rode o importador sem `--metadata-only`, por exemplo:\n\n"
+        "`python tools\\download_anm_dados_gov_to_sqlite.py --source anm-direct --output-dir Z:\\Graph_rag\\anm_sqlite`"
+    )
+
+
 def _answer_datasets(conn, limit=30):
     rows = conn.execute(
         """
@@ -131,7 +184,7 @@ def _answer_resources(conn, query, limit=30):
     where = ""
     terms = []
     for token in re.findall(r"[a-zA-Z0-9_/-]{3,}", qn):
-        if token in {"recurso", "recursos", "tabela", "tabelas", "base", "bases", "listar", "mostre", "quais", "anm"}:
+        if token in RESOURCE_STOPWORDS:
             continue
         terms.append(token)
     if terms:
@@ -160,8 +213,82 @@ def _answer_resources(conn, query, limit=30):
         (*params, limit),
     ).fetchall()
     if not rows:
-        return "Nao encontrei recursos ANM com esses filtros."
+        return (
+            "Nao encontrei recursos ANM com esses filtros.\n\n"
+            "Tente `@anm quais datasets existem?` ou `@anm quais tabelas foram importadas?` para verificar o que foi carregado."
+        )
     return _format_resources(rows)
+
+
+def _find_column(columns, *needles):
+    normalized = [(col, _normalize(col).replace("_", " ")) for col in columns]
+    for needle in needles:
+        needle_norm = _normalize(needle)
+        for original, norm in normalized:
+            if needle_norm in norm:
+                return original
+    return None
+
+
+def _numeric_expr(column):
+    quoted = quote_identifier(column)
+    return f"CAST(REPLACE(REPLACE({quoted}, '.', ''), ',', '.') AS REAL)"
+
+
+def _answer_cfem_aggregate(conn, query, limit=30):
+    tables = [table for table in _list_data_tables(conn, limit=300) if "cfem" in table.lower()]
+    if not tables:
+        return (
+            "Nao encontrei tabela de dados de CFEM importada.\n\n"
+            "Verifique com `@anm quais tabelas foram importadas?`. Se so houver metadados, rode o importador sem `--metadata-only`."
+        ), False
+
+    qn = _normalize(query)
+    table = tables[0]
+    columns = _column_names(conn, table)
+    group_col = None
+    group_label = ""
+    if "municip" in qn or "munic" in qn or "cidade" in qn:
+        group_col = _find_column(columns, "municipio", "cidade")
+        group_label = "Municipio"
+    elif "uf" in qn:
+        group_col = _find_column(columns, "uf", "sigla uf", "estado")
+        group_label = "UF"
+    elif "municipio" in qn or "município" in qn or "cidade" in qn:
+        group_col = _find_column(columns, "municipio", "município", "cidade")
+        group_label = "Municipio"
+    elif "substancia" in qn or "substância" in qn or "mineral" in qn:
+        group_col = _find_column(columns, "substancia", "substância", "mineral")
+        group_label = "Substancia"
+    elif "ano" in qn:
+        group_col = _find_column(columns, "ano", "exercicio", "referencia")
+        group_label = "Ano"
+
+    value_col = _find_column(columns, "valor", "cfem", "arrecadacao", "arrecadação", "recolhido")
+    if not group_col or not value_col:
+        return (
+            "Encontrei tabela CFEM, mas nao consegui identificar automaticamente coluna de agrupamento "
+            f"ou valor.\n\nTabela analisada: `{table}`\n\nColunas: `{', '.join(columns[:40])}`"
+        ), False
+
+    sql = (
+        f"SELECT {quote_identifier(group_col)} AS grupo, "
+        f"SUM({_numeric_expr(value_col)}) AS total "
+        f"FROM {quote_identifier(table)} "
+        f"WHERE {quote_identifier(group_col)} IS NOT NULL AND TRIM(CAST({quote_identifier(group_col)} AS TEXT)) <> '' "
+        f"GROUP BY {quote_identifier(group_col)} "
+        "ORDER BY total DESC "
+        f"LIMIT {int(limit)}"
+    )
+    rows = conn.execute(sql).fetchall()
+    if not rows:
+        return f"A consulta CFEM na tabela `{table}` nao retornou linhas.", True
+    answer = (
+        f"Resultado de CFEM por {group_label} usando a tabela `{table}` "
+        f"e a coluna de valor `{value_col}`:\n\n"
+        + _md_table([group_label, "Total"], [[row["grupo"], row["total"]] for row in rows])
+    )
+    return answer, True
 
 
 def _answer_sample(conn, query, limit=20):
@@ -210,12 +337,18 @@ def answer_anm_query(query, db_path=None, limit=30, llm_model=None, progress_cal
             answer = "O SQLite encontrado nao parece ser uma base ANM importada: faltam `datasets` e/ou `resources`."
         elif any(term in qn for term in ("schema", "esquema", "estrutura", "colunas", "dicionario", "dicionário")):
             answer = _answer_schema(conn, limit=limit)
+        elif "tabela" in qn or "tabelas" in qn:
+            answer = _answer_imported_tables(conn, limit=limit)
         elif any(term in qn for term in ("dataset", "datasets", "conjunto", "conjuntos")):
             answer = _answer_datasets(conn, limit=limit)
         elif any(term in qn for term in ("amostra", "exemplo", "linhas", "mostrar dados", "ver dados")):
             answer = _answer_sample(conn, query, limit=min(limit, 50))
         elif any(term in qn for term in ("recurso", "recursos", "tabela", "tabelas", "cfem", "amb", "dipem", "barragem")):
-            if any(term in qn for term in ("quantos", "total", "soma", "media", "média", "maior", "menor", "por ", "ranking", "listar")) and _list_data_tables(conn, limit=1):
+            if "cfem" in qn and any(term in qn for term in ("total", "soma", "por ", "ranking", "maior", "menor")):
+                answer, handled_cfem = _answer_cfem_aggregate(conn, query, limit=limit)
+                if not handled_cfem:
+                    agent_evidence = ["Consulta CFEM deterministica nao encontrou colunas suficientes."]
+            elif any(term in qn for term in ("quantos", "total", "soma", "media", "média", "maior", "menor", "por ", "ranking", "listar")) and _list_data_tables(conn, limit=1):
                 try:
                     answer, agent_evidence, agent_meta = answer_sql_agent_query(
                         conn,
@@ -225,7 +358,11 @@ def answer_anm_query(query, db_path=None, limit=30, llm_model=None, progress_cal
                         progress_callback=progress_callback,
                     )
                 except Exception as exc:
-                    answer = _answer_resources(conn, query, limit=limit)
+                    answer = (
+                        "O SQL Agent nao conseguiu gerar/executar a consulta estruturada.\n\n"
+                        f"Motivo: `{exc}`\n\n"
+                        "Use `@anm esquema da base` ou `@anm quais tabelas foram importadas?` para conferir nomes de tabelas e colunas."
+                    )
                     agent_evidence = [f"SQL Agent indisponivel; fallback para metadados: {exc}"]
             else:
                 answer = _answer_resources(conn, query, limit=limit)
