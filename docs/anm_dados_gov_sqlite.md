@@ -100,3 +100,28 @@ caminho padrao, defina:
 ```powershell
 $env:ANM_SQLITE_PATH = "Z:\Graph_rag\anm_sqlite\anm_dados_gov.sqlite"
 ```
+
+## SQL Agent
+
+O comando `@anm` tambem possui uma camada inicial de SQL Agent:
+
+- descobre automaticamente tabelas e colunas do SQLite;
+- detecta entidades como CNPJ, CPF, processo, barragem, municipio, substancia e CFEM;
+- classifica consultas estruturadas como `sql_only`;
+- gera SQL SQLite via LLM;
+- aceita apenas `SELECT` ou `WITH`;
+- bloqueia `DROP`, `DELETE`, `UPDATE`, `INSERT`, `ALTER`, `ATTACH`, `PRAGMA` e comandos semelhantes;
+- aplica `LIMIT`, timeout e autorizador SQLite somente-leitura;
+- consolida o resultado com LLM quando disponivel.
+
+Exemplos:
+
+```text
+@anm esquema da base
+@anm quais tabelas foram importadas?
+@anm total de CFEM por municipio
+@anm quais barragens existem por UF?
+```
+
+Se a base tiver apenas metadados, rode o importador sem `--metadata-only` para
+criar tabelas de dados consultaveis pelo SQL Agent.

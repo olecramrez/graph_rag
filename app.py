@@ -3589,6 +3589,7 @@ with main_col:
                 on_timing(f"[QUERY][ANM] {_short_log_text(query_for_rag)}")
                 resposta_completa, reranked, routing = answer_anm_query(
                     query_for_rag,
+                    llm_model=final_llm_model,
                     progress_callback=on_timing,
                 )
                 routing["route_source"] = search_route.get("source")
@@ -3681,6 +3682,8 @@ with main_col:
             modo_final = "CNPJ Perfil cadastral"
         elif routing.get("strategy") in {"cnpj_sqlite", "cnpj_sqlite_llm_intent"}:
             modo_final = "CNPJ SQLite"
+        elif routing.get("strategy") == "anm_sqlite":
+            modo_final = "ANM SQLite"
         elif st.session_state.get("multi_base_enabled"):
             modo_final = "Multibase"
         elif modo_consulta == "Forcar Documento Especifico":

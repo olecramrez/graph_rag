@@ -4,6 +4,7 @@ from pathlib import Path
 
 from src.config import get_anm_db_path
 from src.cnpj_query import _md_table
+from src.sql_agent import answer_sql_agent_query, discover_sqlite_schema
 
 
 def _normalize(text):
@@ -88,6 +89,24 @@ def _answer_overview(conn):
     return "\n\n".join(answer)
 
 
+def _answer_schema(conn, limit=80):
+    schema = discover_sqlite_schema(conn, max_tables=limit)
+    rows = []
+    for table in schema:
+        columns = table.get("columns") or []
+        rows.append(
+            [
+                table["table"],
+                table.get("description", ""),
+                len(columns),
+                ", ".join(col["name"] for col in columns[:12]),
+            ]
+        )
+    if not rows:
+        return "Nao encontrei tabelas no SQLite ANM."
+    return _md_table(["Tabela", "Descricao", "Colunas", "Primeiras colunas"], rows)
+
+
 def _answer_datasets(conn, limit=30):
     rows = conn.execute(
         """
@@ -167,7 +186,7 @@ def _answer_sample(conn, query, limit=20):
     return f"Amostra da tabela `{chosen}`:\n\n" + _md_table(list(headers), table_rows)
 
 
-def answer_anm_query(query, db_path=None, limit=30, progress_callback=None):
+def answer_anm_query(query, db_path=None, limit=30, llm_model=None, progress_callback=None):
     conn, path = _connect(db_path)
     if conn is None:
         return (
@@ -184,24 +203,63 @@ def answer_anm_query(query, db_path=None, limit=30, progress_callback=None):
         if progress_callback:
             progress_callback(f"[QUERY][ANM] {query}")
 
+        agent_evidence = []
+        agent_meta = None
+
         if not _table_exists(conn, "datasets") or not _table_exists(conn, "resources"):
             answer = "O SQLite encontrado nao parece ser uma base ANM importada: faltam `datasets` e/ou `resources`."
+        elif any(term in qn for term in ("schema", "esquema", "estrutura", "colunas", "dicionario", "dicionário")):
+            answer = _answer_schema(conn, limit=limit)
         elif any(term in qn for term in ("dataset", "datasets", "conjunto", "conjuntos")):
             answer = _answer_datasets(conn, limit=limit)
         elif any(term in qn for term in ("amostra", "exemplo", "linhas", "mostrar dados", "ver dados")):
             answer = _answer_sample(conn, query, limit=min(limit, 50))
         elif any(term in qn for term in ("recurso", "recursos", "tabela", "tabelas", "cfem", "amb", "dipem", "barragem")):
-            answer = _answer_resources(conn, query, limit=limit)
+            if any(term in qn for term in ("quantos", "total", "soma", "media", "média", "maior", "menor", "por ", "ranking", "listar")) and _list_data_tables(conn, limit=1):
+                try:
+                    answer, agent_evidence, agent_meta = answer_sql_agent_query(
+                        conn,
+                        query,
+                        llm_model=llm_model,
+                        limit=max(limit, 100),
+                        progress_callback=progress_callback,
+                    )
+                except Exception as exc:
+                    answer = _answer_resources(conn, query, limit=limit)
+                    agent_evidence = [f"SQL Agent indisponivel; fallback para metadados: {exc}"]
+            else:
+                answer = _answer_resources(conn, query, limit=limit)
         else:
-            answer = _answer_overview(conn)
+            if _list_data_tables(conn, limit=1):
+                try:
+                    answer, agent_evidence, agent_meta = answer_sql_agent_query(
+                        conn,
+                        query,
+                        llm_model=llm_model,
+                        limit=max(limit, 100),
+                        progress_callback=progress_callback,
+                    )
+                except Exception as exc:
+                    answer = _answer_overview(conn)
+                    agent_evidence = [f"SQL Agent indisponivel; fallback para visao geral: {exc}"]
+            else:
+                answer = _answer_overview(conn)
+
+        evidence_items = [
+            f"- Banco consultado: `{path}`",
+            "- Consulta via comando explicito `@anm`.",
+        ]
+        evidence_items.extend(f"- {item}" for item in agent_evidence)
 
         final_output = (
             f"# Resposta\n\n{answer}\n\n"
             "---\n\n"
             "# Evidencia\n\n"
-            f"- Banco consultado: `{path}`\n\n"
-            "- Consulta via comando explicito `@anm`."
+            + "\n\n".join(evidence_items)
         )
-        return final_output, [], {"strategy": "anm_sqlite", "db_path": str(path), "found": True}
+        routing = {"strategy": "anm_sqlite", "db_path": str(path), "found": True}
+        if agent_meta:
+            routing["sql_agent"] = agent_meta
+        return final_output, [], routing
     finally:
         conn.close()
