@@ -23,6 +23,7 @@ env/
 logs/
 logs_indexacao/
 reports/
+tmp_*/
 
 # Local data, indexes, databases, and generated corpora
 data/
