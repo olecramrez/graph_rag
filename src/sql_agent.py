@@ -416,5 +416,8 @@ def answer_sql_agent_query(
         "mode": mode,
         "sql": safe_sql,
         "rows": len(rows),
-        "schema_tables": [table["table"] for table in relevant_schema],
+        "schema_tables": [
+            table["table"] 
+            for table in relevant_schema
+        ],
     }
