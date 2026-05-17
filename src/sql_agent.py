@@ -294,8 +294,10 @@ Regras obrigatorias:
 - Gere apenas uma consulta SELECT ou WITH.
 - Nunca use DROP, DELETE, UPDATE, INSERT, ALTER, ATTACH, DETACH, PRAGMA, VACUUM, CREATE.
 - Use somente tabelas e colunas presentes no schema.
-- Para comparacoes textuais de substancias minerais, UFs e nomes, utilize comparacao case-insensitive.
-- Prefira UPPER(coluna) = UPPER(valor).
+- Para substancias minerais, prefira buscas flexiveis usando LIKE.
+- Exemplo: UPPER(substância_mineral) LIKE '%FERRO%'.
+- Evite igualdade exata para nomes minerais.
+- Considere variacoes de acentuacao e nomenclatura.- Prefira UPPER(coluna) = UPPER(valor).
 - Considere que os dados podem estar sem acentos.
 - Nunca invente colunas genéricas como cpf_cnpj, empresa, valor, nome ou data se elas não aparecerem exatamente no schema.
 - Os nomes das colunas devem ser copiados exatamente como aparecem no schema.
