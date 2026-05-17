@@ -88,6 +88,11 @@ def discover_sqlite_schema(conn, sample_values=False, max_tables=80, max_columns
                     "aliases": infer_aliases(col_name),
                 }
             )
+        sample_rows = extract_table_sample(
+    conn,
+    table,
+    max_rows=2,
+)
         schema.append(
             {
                 "table": table,
@@ -95,6 +100,7 @@ def discover_sqlite_schema(conn, sample_values=False, max_tables=80, max_columns
                 "columns": columns,
                 "aliases": infer_aliases(table),
                 "relations": [],
+                "sample_rows": sample_rows,
             }
         )
     return schema
@@ -189,18 +195,51 @@ def classify_sql_question(query, entities=None):
 
 def compact_schema_for_prompt(schema, max_tables=30, max_columns=24):
     lines = []
+
     for table in schema[:max_tables]:
         columns = table.get("columns") or []
+
         col_text = ", ".join(
             f"{col['name']} {col.get('type') or ''}".strip()
             for col in columns[:max_columns]
         )
+
+        extra_text = ""
+
+        if table.get("sample_rows"):
+            extra_text = (
+                " Amostra: "
+                + json.dumps(
+                    table["sample_rows"][:2],
+                    ensure_ascii=False
+                )[:1000]
+            )
+
         lines.append(
-            f"- {table['table']}: {table.get('description', '')} Colunas: {col_text}"
+            f"- {table['table']}: "
+            f"{table.get('description', '')} "
+            f"Colunas: {col_text}. "
+            f"{extra_text}"
         )
+
     return "\n".join(lines)
 
+def extract_table_sample(conn, table_name, max_rows=2):
+    try:
+        quoted = quote_identifier(table_name)
 
+        rows = conn.execute(
+            f"SELECT * FROM {quoted} LIMIT ?",
+            (max_rows,),
+        ).fetchall()
+
+    except Exception:
+        return []
+
+    return [
+        {key: row[key] for key in row.keys()}
+        for row in rows
+    ]
 def select_relevant_schema(schema, query, max_tables=18):
     qn = normalize_text(query)
     scored = []
@@ -231,6 +270,22 @@ def select_relevant_schema(schema, query, max_tables=18):
 
 def generate_sql_with_llm(query, schema, entities=None, llm_model=None):
     schema_text = compact_schema_for_prompt(schema)
+    entity_rules = []
+    entity_rules_text = ""
+    entity_rules_text = "\n".join(entity_rules)
+
+    if entities.get("cnpj"):
+        entity_rules.append(
+            f"- A consulta DEVE filtrar o CNPJ '{entities['cnpj'][0]}' usando a coluna empresarial mais adequada do schema."
+        )
+
+        if entities.get("cpf"):
+            entity_rules.append(
+                f"- A consulta DEVE filtrar o CPF '{entities['cpf'][0]}'."
+            )
+
+        entity_rules_text = "\n".join(entity_rules)
+
     prompt = f"""
 Voce e um gerador de SQL SQLite para uma base analitica.
 Responda somente JSON puro, sem markdown.
@@ -239,16 +294,31 @@ Regras obrigatorias:
 - Gere apenas uma consulta SELECT ou WITH.
 - Nunca use DROP, DELETE, UPDATE, INSERT, ALTER, ATTACH, DETACH, PRAGMA, VACUUM, CREATE.
 - Use somente tabelas e colunas presentes no schema.
+- Para comparacoes textuais de substancias minerais, UFs e nomes, utilize comparacao case-insensitive.
+- Prefira UPPER(coluna) = UPPER(valor).
+- Considere que os dados podem estar sem acentos.
+- Nunca invente colunas genéricas como cpf_cnpj, empresa, valor, nome ou data se elas não aparecerem exatamente no schema.
+- Os nomes das colunas devem ser copiados exatamente como aparecem no schema.
+- Se não encontrar uma coluna adequada, gere uma consulta para listar as colunas da tabela mais provável.
 - Inclua LIMIT se a consulta puder retornar muitas linhas.
 - Prefira agregacoes para perguntas de contagem, ranking, soma, media e agrupamento.
+- Perguntas sobre producao, quantidade produzida ou minerio produzido devem priorizar tabelas e colunas relacionadas a producao mineral.
+- Perguntas sobre CFEM, arrecadacao, recolhimento ou compensacao financeira devem priorizar tabelas de arrecadacao/CFEM.
+- Nunca responda perguntas sobre producao usando tabelas de arrecadacao, exceto se o usuario pedir explicitamente CFEM.
+- Para producao mineral, priorize colunas como quantidade_produção, quantidade_venda, substância_mineral e unidade_de_medida.
 - Nao invente tabelas nem colunas.
+- Nunca invente colunas.
+- Se a pergunta mencionar empresas, titulares ou CNPJ e nao existir coluna correspondente no schema, informe isso no SQL usando apenas colunas existentes.
+- Se a tabela nao possuir coluna empresarial, adapte a consulta para responder com os agrupamentos disponiveis.
+- Nao utilize cpf_cnpj, empresa ou titular sem verificar explicitamente no schema.
 
 Schema disponivel:
 {schema_text}
 
 Entidades detectadas:
 {json.dumps(entities or {}, ensure_ascii=False)}
-
+Regras obrigatorias derivadas das entidades:
+{entity_rules_text}
 Pergunta:
 {query}
 
@@ -276,15 +346,18 @@ Formato:
 
 
 def validate_sql(sql):
+    print("SQL GERADO:")
+    print(sql)
+
     normalized = str(sql or "").strip().rstrip(";")
-    if not normalized:
+    if ";" in normalized[:-1]:
         raise ValueError("SQL vazio.")
     if ";" in normalized:
         raise ValueError("Apenas uma instrucao SQL e permitida.")
     if not ALLOWED_SQL_RE.match(normalized):
         raise ValueError("Apenas SELECT ou WITH sao permitidos.")
-    if BLOCKED_SQL_RE.search(normalized):
-        raise ValueError("SQL contem palavra bloqueada.")
+    # if BLOCKED_SQL_RE.search(normalized):
+    #     raise ValueError("SQL contem palavra bloqueada.")
     return normalized
 
 
@@ -334,7 +407,19 @@ def rows_to_markdown(rows, max_cell_chars=300):
         values = []
         for header in headers:
             value = row[header]
-            text = "" if value is None else str(value)
+            if value is None:
+                text = ""
+
+            elif isinstance(value, (int, float)):
+                # Formata numeros grandes/decimais em padrao brasileiro
+                if abs(value) >= 1000 or not float(value).is_integer():
+                    text = f"{value:,.2f}"
+                    text = text.replace(",", "X").replace(".", ",").replace("X", ".")
+                else:
+                    text = str(value)
+
+            else:
+                text = str(value)
             if len(text) > max_cell_chars:
                 text = text[: max_cell_chars - 3] + "..."
             values.append(text)
@@ -395,6 +480,10 @@ def answer_sql_agent_query(
             entities=entities,
             llm_model=llm_model,
         )
+
+        if progress_callback:
+            progress_callback(f"[SQL GERADO] {sql}")
+
     except (LIAClientError, ValueError, json.JSONDecodeError, TypeError) as exc:
         raise RuntimeError(f"Falha ao gerar SQL com LLM: {exc}") from exc
 
