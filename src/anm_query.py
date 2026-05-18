@@ -1,3 +1,6 @@
+import json
+import sre_constants
+import sre_constants
 import re
 import sqlite3
 import unicodedata
@@ -5,7 +8,15 @@ from pathlib import Path
 
 from src.config import get_anm_db_path
 from src.cnpj_query import _md_table
-from src.sql_agent import answer_sql_agent_query, discover_sqlite_schema, quote_identifier
+from src.lia_client import LIAClientError, chat_completion
+from src.sql_agent import (
+    answer_sql_agent_query,
+    compact_schema_for_prompt,
+    discover_sqlite_schema,
+    extract_json_object,
+    quote_identifier,
+    select_relevant_schema,
+)
 
 
 RESOURCE_STOPWORDS = {
@@ -124,6 +135,188 @@ def _answer_schema(conn, limit=80):
     return _md_table(["Tabela", "Descricao", "Colunas", "Primeiras colunas"], rows)
 
 
+def _is_feasibility_query(query):
+    qn = _normalize(query)
+    patterns = (
+        "e possivel",
+        "seria possivel",
+        "da para",
+        "daria para",
+        "tem como",
+        "consigo",
+        "conseguimos",
+        "a base permite",
+        "a base tem",
+        "existe dado",
+        "existem dados",
+        "ha dados",
+        "ha como",
+        "pode consultar",
+        "posso consultar",
+    )
+    return any(pattern in qn for pattern in patterns)
+
+
+def _answer_query_feasibility(conn, query, limit=80, llm_model=None, progress_callback=None):
+    schema = discover_sqlite_schema(conn, max_tables=limit)
+    relevant_schema = select_relevant_schema(schema, query, max_tables=12)
+    schema_text = compact_schema_for_prompt(relevant_schema, max_tables=12, max_columns=30)
+
+    if progress_callback:
+        tables = ", ".join(table["table"] for table in relevant_schema[:8])
+        progress_callback(f"[INFO] ANM: avaliando viabilidade no schema ({tables})")
+
+    prompt = f"""
+Voce avalia se uma consulta pode ser respondida usando uma base SQLite da ANM.
+Nao gere SQL executavel e nao invente tabelas ou colunas.
+Use somente o schema fornecido.
+
+Responda em portugues com:
+1. Veredito: Sim, Parcialmente ou Nao.
+2. Tabelas candidatas.
+3. Colunas relevantes.
+4. O que falta, se nao for possivel ou se for parcial.
+5. Uma forma curta de perguntar a consulta executavel, se for possivel.
+
+Schema disponivel:
+{schema_text}
+
+Pergunta do usuario:
+{query}
+""".strip()
+
+    try:
+        answer = chat_completion(
+            [
+                {
+                    "role": "system",
+                    "content": "Voce avalia viabilidade de consultas SQL com fidelidade estrita ao schema.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0.0,
+            max_retries=2,
+            llm_model=llm_model,
+        )
+        evidence = [
+            "Modo de viabilidade: o SQL Agent analisou o schema sem executar consulta.",
+            "Tabelas consideradas: `" + "`, `".join(table["table"] for table in relevant_schema) + "`.",
+        ]
+        return answer, evidence
+    except LIAClientError as exc:
+        rows = []
+        for table in relevant_schema:
+            columns = table.get("columns") or []
+            rows.append([
+                table["table"],
+                table.get("description", ""),
+                ", ".join(col["name"] for col in columns[:20]),
+            ])
+        answer = (
+            "Nao consegui acionar o LLM para avaliar a viabilidade agora.\n\n"
+            "Schema mais provavel para conferir manualmente:\n\n"
+            + _md_table(["Tabela", "Descricao", "Colunas"], rows)
+        )
+        return answer, [f"Modo de viabilidade indisponivel: {exc}"]
+
+
+def _route_anm_query_with_llm(conn, query, limit=80, llm_model=None, progress_callback=None):
+    schema = discover_sqlite_schema(conn, max_tables=limit)
+    relevant_schema = select_relevant_schema(schema, query, max_tables=12)
+    schema_text = compact_schema_for_prompt(relevant_schema, max_tables=12, max_columns=24)
+    data_tables = _list_data_tables(conn, limit=40)
+
+    prompt = f"""
+Voce e o router de consultas para um SQLite da ANM.
+Escolha exatamente uma rota com base na pergunta e no schema.
+Nao responda a pergunta do usuario; apenas escolha a rota.
+
+Rotas validas:
+- "schema": o usuario quer estrutura, colunas, dicionario ou schema.
+- "tables": o usuario quer listar tabelas importadas.
+- "datasets": o usuario quer datasets/conjuntos registrados.
+- "sample": o usuario quer amostra/exemplos/linhas de dados.
+- "feasibility": o usuario pergunta se e possivel, se da para, se a base permite ou o que falta para realizar uma consulta.
+- "resources": o usuario quer localizar recursos/arquivos/metadados, sem pedir calculo nos dados.
+- "sql": o usuario pede uma consulta analitica, ranking, filtro, soma, media, comparacao, listagem de registros, agregacao ou resposta calculada a partir das tabelas.
+- "overview": pedido generico sobre a base, sem objetivo consultivo claro.
+
+Observacoes:
+- Perguntas como "quais empresas arrecadam acima da media nacional" sao rota "sql".
+- Perguntas de CFEM, arrecadacao, recolhimento, producao, barragens, municipio, UF, empresa, ranking, media ou total normalmente sao "sql".
+- Use "resources" apenas quando a pergunta for sobre quais arquivos/recursos existem, nao quando pedir resposta calculada.
+
+Tabelas de dados importadas:
+{json.dumps(data_tables, ensure_ascii=False)}
+
+Schema relevante:
+{schema_text}
+
+Pergunta:
+{query}
+
+Responda somente JSON:
+{{
+  "route": "sql",
+  "confidence": "high",
+  "reason": "breve justificativa"
+}}
+""".strip()
+
+    raw = chat_completion(
+        [
+            {"role": "system", "content": "Voce escolhe rotas de consulta SQLite e responde somente JSON valido."},
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.0,
+        max_retries=2,
+        llm_model=llm_model,
+    )
+    payload = extract_json_object(raw)
+    route = str(payload.get("route") or "overview").strip().lower()
+    valid_routes = {
+        "schema",
+        "tables",
+        "datasets",
+        "sample",
+        "feasibility",
+        "resources",
+        "sql",
+        "overview",
+    }
+    if route not in valid_routes:
+        route = "overview"
+
+    payload["route"] = route
+
+    if progress_callback:
+        progress_callback(f"[ROUTER][ANM] rota={route}; motivo={payload.get('reason', '')}")
+
+    return payload
+
+
+def _fallback_anm_route(query):
+    qn = _normalize(query)
+    if any(term in qn for term in ("schema", "esquema", "estrutura", "colunas", "dicionario", "dicionario")):
+        return {"route": "schema", "reason": "Fallback local: pedido explicito de schema."}
+    if "tabela" in qn or "tabelas" in qn:
+        return {"route": "tables", "reason": "Fallback local: pedido explicito de tabelas."}
+    if any(term in qn for term in ("dataset", "datasets", "conjunto", "conjuntos")):
+        return {"route": "datasets", "reason": "Fallback local: pedido explicito de datasets."}
+    if any(term in qn for term in ("amostra", "exemplo", "linhas", "mostrar dados", "ver dados")):
+        return {"route": "sample", "reason": "Fallback local: pedido explicito de amostra."}
+    if _is_feasibility_query(query):
+        return {"route": "feasibility", "reason": "Fallback local: pedido de viabilidade."}
+    if _list_like_query(qn):
+        return {"route": "resources", "reason": "Fallback local: pedido de recursos/metadados."}
+    return {"route": "sql", "reason": "Fallback local: consulta encaminhada ao SQL Agent."}
+
+
+def _list_like_query(qn):
+    resource_terms = ("recurso", "recursos", "arquivo", "arquivos")
+    return any(term in qn for term in resource_terms)
+
+
 def _answer_imported_tables(conn, limit=80):
     data_tables = _list_data_tables(conn, limit=limit)
     data_rows = [[name, _count_table(conn, name), ", ".join(_column_names(conn, name)[:10])] for name in data_tables]
@@ -235,6 +428,49 @@ def _numeric_expr(column):
     return f"CAST(REPLACE(REPLACE({quoted}, '.', ''), ',', '.') AS REAL)"
 
 
+def _is_cfem_query(qn):
+    return any(term in qn for term in ("cfem", "arrecad", "recolh", "compensacao financeira"))
+
+
+def _is_above_average_query(qn):
+    return any(
+        term in qn
+        for term in (
+            "acima da media",
+            "acima da m?dia",
+            "acima do medio",
+            "maior que a media",
+            "maior que a m?dia",
+            "maiores que a media",
+            "maiores que a m?dia",
+            "superior a media",
+            "superior a m?dia",
+            "superiores a media",
+            "superiores a m?dia",
+        )
+    )
+
+
+def _select_cfem_table(tables):
+    preferred = [
+        "anm_cfem_cfem_arrecadacao_csv_data",
+        "cfem_arrecadacao_csv_data",
+    ]
+    by_lower = {table.lower(): table for table in tables}
+    for name in preferred:
+        if name in by_lower:
+            return by_lower[name]
+
+    arrecadacao_tables = [
+        table
+        for table in tables
+        if "arrecad" in table.lower()
+        and "autuacao" not in table.lower()
+        and "distribuicao" not in table.lower()
+    ]
+    return arrecadacao_tables[0] if arrecadacao_tables else tables[0]
+
+
 def _answer_cfem_aggregate(conn, query, limit=30):
     tables = [table for table in _list_data_tables(conn, limit=300) if "cfem" in table.lower()]
     if not tables:
@@ -244,14 +480,14 @@ def _answer_cfem_aggregate(conn, query, limit=30):
         ), False
 
     qn = _normalize(query)
-    table = tables[0]
+    table = _select_cfem_table(tables)
     columns = _column_names(conn, table)
     group_col = None
     group_label = ""
     if "municip" in qn or "munic" in qn or "cidade" in qn:
         group_col = _find_column(columns, "municipio", "cidade")
         group_label = "Municipio"
-    elif "uf" in qn:
+    elif "uf" in qn or "estado" in qn:
         group_col = _find_column(columns, "uf", "sigla uf", "estado")
         group_label = "UF"
     elif "municipio" in qn or "município" in qn or "cidade" in qn:
@@ -260,6 +496,20 @@ def _answer_cfem_aggregate(conn, query, limit=30):
     elif "substancia" in qn or "substância" in qn or "mineral" in qn:
         group_col = _find_column(columns, "substancia", "substância", "mineral")
         group_label = "Substancia"
+    elif (
+        "empresa" in qn
+        or "empresas" in qn
+        or "cpf" in qn
+        or "cnpj" in qn
+    ):
+        group_col = _find_column(
+            columns,
+            "cpf_cnpj",
+            "cpf",
+            "cnpj",
+            "empresa"
+        )
+        group_label = "Empresa"
     elif "ano" in qn:
         group_col = _find_column(columns, "ano", "exercicio", "referencia")
         group_label = "Ano"
@@ -270,6 +520,37 @@ def _answer_cfem_aggregate(conn, query, limit=30):
             "Encontrei tabela CFEM, mas nao consegui identificar automaticamente coluna de agrupamento "
             f"ou valor.\n\nTabela analisada: `{table}`\n\nColunas: `{', '.join(columns[:40])}`"
         ), False
+
+    if _is_above_average_query(qn):
+        sql = (
+            "WITH totais AS ("
+            f"SELECT {quote_identifier(group_col)} AS grupo, "
+            f"SUM({_numeric_expr(value_col)}) AS total "
+            f"FROM {quote_identifier(table)} "
+            f"WHERE {quote_identifier(group_col)} IS NOT NULL "
+            f"AND TRIM(CAST({quote_identifier(group_col)} AS TEXT)) <> '' "
+            f"GROUP BY {quote_identifier(group_col)}"
+            "), media AS ("
+            "SELECT AVG(total) AS media_nacional FROM totais"
+            ") "
+            "SELECT totais.grupo, totais.total, media.media_nacional "
+            "FROM totais CROSS JOIN media "
+            "WHERE totais.total > media.media_nacional "
+            "ORDER BY totais.total DESC "
+            f"LIMIT {int(limit)}"
+        )
+        rows = conn.execute(sql).fetchall()
+        if not rows:
+            return f"A consulta CFEM na tabela `{table}` nao retornou grupos acima da media.", True
+        answer = (
+            f"Empresas com arrecadacao CFEM acima da media nacional usando a tabela `{table}`. "
+            "Aqui, a media nacional foi calculada como a media dos totais arrecadados por empresa no periodo disponivel:\n\n"
+            + _md_table(
+                [group_label, "Total", "Media nacional"],
+                [[row["grupo"], row["total"], row["media_nacional"]] for row in rows],
+            )
+        )
+        return answer, True
 
     sql = (
         f"SELECT {quote_identifier(group_col)} AS grupo, "
@@ -335,50 +616,67 @@ def answer_anm_query(query, db_path=None, limit=30, llm_model=None, progress_cal
 
         if not _table_exists(conn, "datasets") or not _table_exists(conn, "resources"):
             answer = "O SQLite encontrado nao parece ser uma base ANM importada: faltam `datasets` e/ou `resources`."
-        elif any(term in qn for term in ("schema", "esquema", "estrutura", "colunas", "dicionario", "dicionário")):
-            answer = _answer_schema(conn, limit=limit)
-        elif "tabela" in qn or "tabelas" in qn:
-            answer = _answer_imported_tables(conn, limit=limit)
-        elif any(term in qn for term in ("dataset", "datasets", "conjunto", "conjuntos")):
-            answer = _answer_datasets(conn, limit=limit)
-        elif any(term in qn for term in ("amostra", "exemplo", "linhas", "mostrar dados", "ver dados")):
-            answer = _answer_sample(conn, query, limit=min(limit, 50))
-        elif any(term in qn for term in ("recurso", "recursos", "tabela", "tabelas", "cfem", "amb", "dipem", "barragem")):
-            if "cfem" in qn and any(term in qn for term in ("total", "soma", "por ", "ranking", "maior", "menor")):
-                answer, handled_cfem = _answer_cfem_aggregate(conn, query, limit=limit)
-                if not handled_cfem:
-                    agent_evidence = ["Consulta CFEM deterministica nao encontrou colunas suficientes."]
-            elif any(term in qn for term in ("quantos", "total", "soma", "media", "média", "maior", "menor", "por ", "ranking", "listar")) and _list_data_tables(conn, limit=1):
-                try:
-                    answer, agent_evidence, agent_meta = answer_sql_agent_query(
-                        conn,
-                        query,
-                        llm_model=llm_model,
-                        limit=max(limit, 100),
-                        progress_callback=progress_callback,
-                    )
-                except Exception as exc:
-                    answer = (
-                        "O SQL Agent nao conseguiu gerar/executar a consulta estruturada.\n\n"
-                        f"Motivo: `{exc}`\n\n"
-                        "Use `@anm esquema da base` ou `@anm quais tabelas foram importadas?` para conferir nomes de tabelas e colunas."
-                    )
-                    agent_evidence = [f"SQL Agent indisponivel; fallback para metadados: {exc}"]
-            else:
-                answer = _answer_resources(conn, query, limit=limit)
         else:
-            if _list_data_tables(conn, limit=1):
-                try:
-                    answer, agent_evidence, agent_meta = answer_sql_agent_query(
-                        conn,
-                        query,
-                        llm_model=llm_model,
-                        limit=max(limit, 100),
-                        progress_callback=progress_callback,
-                    )
-                except Exception as exc:
+            try:
+                route_info = _route_anm_query_with_llm(
+                    conn,
+                    query,
+                    limit=max(limit, 80),
+                    llm_model=llm_model,
+                    progress_callback=progress_callback,
+                )
+            except (LIAClientError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                route_info = _fallback_anm_route(query)
+                agent_evidence.append(f"Router LLM indisponivel; usando fallback local: {exc}")
+
+            route = route_info.get("route") or "overview"
+            agent_evidence.append(
+                f"Router ANM escolheu rota `{route}`: {route_info.get('reason', '')}"
+            )
+
+            if route == "schema":
+                answer = _answer_schema(conn, limit=limit)
+            elif route == "tables":
+                answer = _answer_imported_tables(conn, limit=limit)
+            elif route == "datasets":
+                answer = _answer_datasets(conn, limit=limit)
+            elif route == "sample":
+                answer = _answer_sample(conn, query, limit=min(limit, 50))
+            elif route == "feasibility":
+                answer, feasibility_evidence = _answer_query_feasibility(
+                    conn,
+                    query,
+                    limit=max(limit, 80),
+                    llm_model=llm_model,
+                    progress_callback=progress_callback,
+                )
+                agent_evidence.extend(feasibility_evidence)
+            elif route == "resources":
+                answer = _answer_resources(conn, query, limit=limit)
+            elif route == "sql":
+                if _list_data_tables(conn, limit=1):
+                    try:
+                        answer, sql_evidence, agent_meta = answer_sql_agent_query(
+                            conn,
+                            query,
+                            llm_model=llm_model,
+                            limit=max(limit, 100),
+                            progress_callback=progress_callback,
+                        )
+                        agent_evidence.extend(sql_evidence or [])
+                    except Exception as exc:
+                        answer = (
+                            "O router LLM classificou esta pergunta como consulta analitica SQL, "
+                            "mas o SQL Agent nao conseguiu gerar/executar a consulta.\n\n"
+                            f"Motivo: `{exc}`\n\n"
+                            "Use `@anm esquema da base` ou "
+                            "`@anm quais tabelas foram importadas?` "
+                            "para conferir os nomes de tabelas e colunas."
+                        )
+                        agent_evidence.append(f"SQL Agent indisponivel para rota `sql`: {exc}")
+                else:
                     answer = _answer_overview(conn)
-                    agent_evidence = [f"SQL Agent indisponivel; fallback para visao geral: {exc}"]
+                    agent_evidence.append("Router escolheu `sql`, mas nao ha tabelas de dados importadas.")
             else:
                 answer = _answer_overview(conn)
 

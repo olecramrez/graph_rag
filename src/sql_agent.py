@@ -3,7 +3,7 @@ import re
 import sqlite3
 import time
 
-from src.cnpj_query import _md_table
+from src.utils_table import _md_table
 from src.lia_client import LIAClientError, chat_completion
 
 
@@ -149,19 +149,154 @@ def infer_column_description(column):
 def infer_aliases(name):
     text = normalize_text(name).replace("_", " ")
     aliases = set(filter(None, [text]))
+
     alias_map = {
-        "razao": ["razao social", "razão social", "empresa", "nome empresarial"],
-        "cnpj": ["cnpj", "empresa"],
-        "cpf": ["cpf", "pessoa fisica", "pessoa física"],
-        "municipio": ["municipio", "município", "cidade"],
-        "substancia": ["substancia", "substância", "mineral"],
-        "cfem": ["cfem", "arrecadacao", "arrecadação"],
-        "barragem": ["barragem", "barragens"],
-        "processo": ["processo", "processo minerario", "processo minerário"],
+        "razao": [
+            "razao social",
+            "razão social",
+            "empresa",
+            "nome empresarial",
+            "mineradora",
+            "companhia",
+        ],
+
+        "empresa": [
+            "empresa",
+            "companhia",
+            "mineradora",
+            "titular",
+            "empreendimento",
+        ],
+
+        "cnpj": [
+            "cnpj",
+            "empresa",
+            "titular",
+            "mineradora",
+            "contribuinte",
+            "pessoa juridica",
+            "pessoa jurídica",
+        ],
+
+        "cpf cnpj": [
+            "empresa",
+            "cnpj",
+            "titular",
+            "mineradora",
+            "contribuinte",
+        ],
+
+        "cpf_cnpj": [
+            "empresa",
+            "cnpj",
+            "titular",
+            "mineradora",
+            "contribuinte",
+        ],
+
+        "cpf": [
+            "cpf",
+            "pessoa fisica",
+            "pessoa física",
+            "contribuinte",
+        ],
+
+        "municipio": [
+            "municipio",
+            "município",
+            "cidade",
+            "localidade",
+        ],
+
+        "uf": [
+            "estado",
+            "uf",
+            "unidade federativa",
+        ],
+
+        "substancia": [
+            "substancia",
+            "substância",
+            "mineral",
+            "minerio",
+            "minério",
+            "produto mineral",
+        ],
+
+        "substância": [
+            "substancia",
+            "substância",
+            "mineral",
+            "minerio",
+            "minério",
+            "produto mineral",
+        ],
+
+        "cfem": [
+            "cfem",
+            "arrecadacao",
+            "arrecadação",
+            "receita mineral",
+            "royalties",
+        ],
+
+        "valor": [
+            "valor",
+            "receita",
+            "arrecadacao",
+            "arrecadação",
+            "montante",
+            "total arrecadado",
+        ],
+
+        "valorrecolhido": [
+            "valor",
+            "cfem",
+            "arrecadacao",
+            "arrecadação",
+            "valor arrecadado",
+            "receita mineral",
+        ],
+
+        "venda": [
+            "venda",
+            "valor venda",
+            "comercializacao",
+            "comercialização",
+            "receita",
+        ],
+
+        "producao": [
+            "producao",
+            "produção",
+            "quantidade produzida",
+            "volume produzido",
+        ],
+
+        "quantidade": [
+            "quantidade",
+            "volume",
+            "total produzido",
+        ],
+
+        "barragem": [
+            "barragem",
+            "barragens",
+            "estrutura",
+        ],
+
+        "processo": [
+            "processo",
+            "processo minerario",
+            "processo minerário",
+            "processo administrativo",
+        ],
     }
+
     for token, values in alias_map.items():
         if token in text:
             aliases.update(values)
+
     return sorted(aliases)
 
 
@@ -310,6 +445,11 @@ Regras obrigatorias:
 - Para producao mineral, priorize colunas como quantidade_produção, quantidade_venda, substância_mineral e unidade_de_medida.
 - Nao invente tabelas nem colunas.
 - Nunca invente colunas.
+- Colunas com aliases relacionados a "empresa", "cnpj", "titular" ou "contribuinte" devem ser usadas como agrupamento empresarial.
+- Colunas com aliases relacionados a "valor", "cfem", "arrecadacao" ou "receita" devem ser usadas como colunas financeiras.
+- A coluna "cpf_cnpj" representa empresa/contribuinte quando existir.
+- A coluna "valorrecolhido" representa arrecadacao CFEM quando existir.
+- Para perguntas sobre concentracao economica, percentual acumulado ou Pareto, utilize SUM() OVER() para acumulados.
 - Se a pergunta mencionar empresas, titulares ou CNPJ e nao existir coluna correspondente no schema, informe isso no SQL usando apenas colunas existentes.
 - Se a tabela nao possuir coluna empresarial, adapte a consulta para responder com os agrupamentos disponiveis.
 - Nao utilize cpf_cnpj, empresa ou titular sem verificar explicitamente no schema.
@@ -351,16 +491,18 @@ def validate_sql(sql):
     print("SQL GERADO:")
     print(sql)
 
-    normalized = str(sql or "").strip().rstrip(";")
-    if ";" in normalized[:-1]:
+    normalized = str(sql or "").strip()
+
+    if not normalized:
         raise ValueError("SQL vazio.")
-    if ";" in normalized:
+
+    if ";" in normalized.rstrip(";"):
         raise ValueError("Apenas uma instrucao SQL e permitida.")
+
     if not ALLOWED_SQL_RE.match(normalized):
         raise ValueError("Apenas SELECT ou WITH sao permitidos.")
-    # if BLOCKED_SQL_RE.search(normalized):
-    #     raise ValueError("SQL contem palavra bloqueada.")
-    return normalized
+
+    return normalized.rstrip(";")
 
 
 def apply_limit(sql, limit):

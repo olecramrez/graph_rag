@@ -1,11 +1,13 @@
+from os import name
 import json
 import os
 import re
 import sqlite3
 import time
 import unicodedata
+from src.utils_table import _md_table
 from pathlib import Path
-
+from src.sql_agent import answer_sql_agent_query, discover_sqlite_schema
 from src.config import get_cnpj_db_path
 from src.lia_client import LIAClientError, chat_completion
 
@@ -347,7 +349,19 @@ def _cnpj_digits(query):
         return digits
     return None
 
+def _extract_multiple_cnpjs(query):
+    matches = re.findall(r"\d[\d./ -]{12,}\d", str(query or ""))
 
+    cnpjs = []
+    seen = set()
+
+    for match in matches:
+        digits = _digits(match)
+        if len(digits) == 14 and digits not in seen:
+            seen.add(digits)
+            cnpjs.append(digits)
+
+    return cnpjs
 def _cnpj_basico_digits(query):
     digits = _digits(query)
     if len(digits) == 8:
@@ -448,7 +462,53 @@ def _query_by_cnpj(conn, cnpj_digits):
         (cnpj_basico, cnpj_ordem, cnpj_dv),
     ).fetchone()
 
+def _query_multiple_cnpjs(conn, cnpjs):
+    if not cnpjs:
+        return []
 
+    placeholders = ",".join(["(?,?,?)"] * len(cnpjs))
+
+    params = []
+
+    for cnpj in cnpjs:
+        params.extend([
+            cnpj[:8],
+            cnpj[8:12],
+            cnpj[12:],
+        ])
+
+    sql = f"""
+    SELECT
+        e.cnpj_basico,
+        e.razao_social,
+        e.natureza_juridica,
+        e.capital_social,
+        e.porte_empresa,
+        est.cnpj_ordem,
+        est.cnpj_dv,
+        est.matriz_filial,
+        est.nome_fantasia,
+        est.situacao_cadastral,
+        est.data_situacao_cadastral,
+        est.data_inicio_atividade,
+        est.cnae_fiscal_principal,
+        est.tipo_logradouro,
+        est.logradouro,
+        est.numero,
+        est.complemento,
+        est.bairro,
+        est.cep,
+        est.uf,
+        est.municipio,
+        est.correio_eletronico
+    FROM estabelecimentos est
+    LEFT JOIN empresas e
+      ON e.cnpj_basico = est.cnpj_basico
+    WHERE (est.cnpj_basico, est.cnpj_ordem, est.cnpj_dv)
+    IN ({placeholders})
+    """
+
+    return conn.execute(sql, tuple(params)).fetchall()
 def _query_by_basico(conn, cnpj_basico, limit):
     return conn.execute(
         """
@@ -494,7 +554,48 @@ def _query_socios(conn, cnpj_basico, limit):
         (cnpj_basico, limit),
     ).fetchall()
 
+def _query_multiple_socios(conn, cnpjs, limit=500):
 
+    if not cnpjs:
+        return []
+
+    basicos = []
+
+    for cnpj in cnpjs:
+        digits = _digits(cnpj)
+
+        if len(digits) == 14:
+            basicos.append(digits[:8])
+
+        elif len(digits) == 8:
+            basicos.append(digits)
+
+    basicos = list(dict.fromkeys(basicos))
+
+    placeholders = ",".join(["?"] * len(basicos))
+
+    sql = f"""
+    SELECT
+        s.cnpj_basico,
+        s.nome_socio_razao_social,
+        s.cpf_cnpj_socio,
+        s.identificador_socio,
+        s.qualificacao_socio,
+        s.data_entrada_sociedade,
+        s.nome_representante,
+        s.faixa_etaria,
+        e.razao_social
+    FROM socios s
+    LEFT JOIN empresas e
+      ON e.cnpj_basico = s.cnpj_basico
+    WHERE s.cnpj_basico IN ({placeholders})
+    ORDER BY e.razao_social, s.nome_socio_razao_social
+    LIMIT ?
+    """
+
+    params = [*basicos, limit]
+
+    return conn.execute(sql, tuple(params)).fetchall()
 def _query_cnae_description(conn, code):
     if not code or not _table_exists(conn, "cnaes"):
         return ""
@@ -537,24 +638,21 @@ def _query_company_headquarters(conn, cnpj_basico):
     ).fetchone()
 
 
-def _query_companies_for_socio_key(conn, socio_key, limit):
+def _query_companies_for_socio_key(conn, socio_key, limit=100):
+
     if not _table_exists(conn, "socios"):
         return []
 
-    key_type = socio_key.get("type")
-    value = socio_key.get("value")
-    if not value:
+    if not socio_key:
         return []
 
-    if key_type == "cpf_cnpj":
-        where_sql = "s.cpf_cnpj_socio = ?"
-        params = (value, limit)
-    else:
-        where_sql = "s.nome_socio_razao_social = ? COLLATE NOCASE"
-        params = (value, limit)
+    # formato:
+    # nome|cpf
+    if "|" in socio_key:
 
-    return conn.execute(
-        f"""
+        nome, cpf = socio_key.split("|", 1)
+
+        sql = """
         SELECT
             s.cnpj_basico,
             s.nome_socio_razao_social,
@@ -570,15 +668,73 @@ def _query_companies_for_socio_key(conn, socio_key, limit):
             est.uf,
             est.municipio
         FROM socios s
-        LEFT JOIN empresas e ON e.cnpj_basico = s.cnpj_basico
+        LEFT JOIN empresas e
+            ON e.cnpj_basico = s.cnpj_basico
         LEFT JOIN estabelecimentos est
-          ON est.cnpj_basico = s.cnpj_basico
-         AND est.cnpj_ordem = '0001'
-        WHERE {where_sql}
+            ON est.cnpj_basico = s.cnpj_basico
+            AND est.cnpj_ordem = '0001'
+        WHERE
+            LOWER(TRIM(s.nome_socio_razao_social)) = ?
+            AND REPLACE(REPLACE(REPLACE(REPLACE(
+                s.cpf_cnpj_socio,
+                '.', ''
+            ), '-', ''), '/', ''), '*', '') LIKE ?
         LIMIT ?
-        """,
-        params,
-    ).fetchall()
+        """
+
+        return conn.execute(
+            sql,
+            (
+                nome.lower().strip(),
+                f"%{cpf}",
+                limit,
+            ),
+        ).fetchall()
+
+    # fallback:
+    # nome:nomecompleto
+    if socio_key.startswith("nome:"):
+
+        nome = socio_key.replace("nome:", "", 1)
+
+        # evita nomes muito genéricos
+        if len(nome) < 12:
+            return []
+
+        sql = """
+        SELECT
+            s.cnpj_basico,
+            s.nome_socio_razao_social,
+            s.cpf_cnpj_socio,
+            s.qualificacao_socio,
+            s.data_entrada_sociedade,
+            e.razao_social,
+            est.cnpj_ordem,
+            est.cnpj_dv,
+            est.nome_fantasia,
+            est.situacao_cadastral,
+            est.cnae_fiscal_principal,
+            est.uf,
+            est.municipio
+        FROM socios s
+        LEFT JOIN empresas e
+            ON e.cnpj_basico = s.cnpj_basico
+        LEFT JOIN estabelecimentos est
+            ON est.cnpj_basico = s.cnpj_basico
+            AND est.cnpj_ordem = '0001'
+        WHERE LOWER(TRIM(s.nome_socio_razao_social)) = ?
+        LIMIT ?
+        """
+
+        return conn.execute(
+            sql,
+            (
+                nome.lower().strip(),
+                limit,
+            ),
+        ).fetchall()
+
+    return []
 
 
 def _query_companies_by_socio_name(conn, person_name, uf=None, limit=20):
@@ -1394,7 +1550,9 @@ def _sanitize_company_mentions(payload):
     except Exception:
         max_depth = 2
     max_depth = max(1, min(max_depth, 3))
-    return companies[:4], max_depth
+    MAX_GRAPH_COMPANIES = 50
+
+    return companies[:MAX_GRAPH_COMPANIES], max_depth
 
 
 def _extract_relationship_mentions_fallback(query):
@@ -1451,7 +1609,9 @@ def _extract_relationship_mentions_fallback(query):
         if key and key not in seen:
             seen.add(key)
             unique.append(mention)
-    return unique[:4], 2
+    MAX_GRAPH_COMPANIES = 50
+
+    return unique[:MAX_GRAPH_COMPANIES], 2
 
 
 def _extract_relationship_mentions(query, llm_model=None, progress_callback=None):
@@ -1555,15 +1715,33 @@ def _resolve_company_mentions(conn, mentions, per_mention_limit=3, progress_call
     return resolved, evidence
 
 
-def _socio_key(row):
-    cpf_cnpj = str(row["cpf_cnpj_socio"] or "").strip()
-    digits = _digits(cpf_cnpj)
-    if digits and len(digits) >= 6 and len(set(digits)) > 1:
-        return {"type": "cpf_cnpj", "value": cpf_cnpj, "strength": "forte"}
 
-    name = re.sub(r"\s+", " ", str(row["nome_socio_razao_social"] or "")).strip()
-    if name:
-        return {"type": "nome", "value": name, "strength": "fraco"}
+def _socio_key(row):
+
+    cpf = re.sub(
+        r"\D",
+        "",
+        str(row["cpf_cnpj_socio"] or ""),
+    )
+
+    nome = _normalize(
+        row["nome_socio_razao_social"] or ""
+    )
+
+    # evita nomes muito pequenos/inuteis
+    if nome and len(nome) < 8:
+        nome = ""
+
+    # chave forte:
+    # nome + cpf parcial
+    if cpf and len(cpf) >= 6 and nome:
+        return f"{nome}|{cpf}"
+
+    # fallback:
+    # apenas nome
+    if nome:
+        return f"nome:{nome}"
+
     return None
 
 
@@ -1589,6 +1767,8 @@ def _format_relationship_path(path):
 
 
 def _find_relationship_paths(conn, source_basicos, target_basicos, max_depth=2, max_paths=5, per_socio_company_limit=100):
+    MAX_PATH_COMPANIES = 1000
+
     target_set = set(target_basicos)
     found = []
     queue = []
@@ -1600,8 +1780,14 @@ def _find_relationship_paths(conn, source_basicos, target_basicos, max_depth=2, 
         if row is not None:
             queue.append((cnpj_basico, [{"type": "company", "row": row}]))
 
+    expanded_nodes = 0
+
     while queue and len(found) < max_paths:
         cnpj_basico, path = queue.pop(0)
+
+        if expanded_nodes >= MAX_PATH_COMPANIES:
+            break
+
         if _path_company_depth(path) >= max_depth:
             continue
 
@@ -1610,8 +1796,8 @@ def _find_relationship_paths(conn, source_basicos, target_basicos, max_depth=2, 
             key = _socio_key(socio)
             if not key:
                 continue
-            key_id = (key["type"], key["value"])
-            if key_id in visited_socio_keys and key["type"] == "nome":
+            key_id = key
+            if key_id in visited_socio_keys and key.startswith("nome:"):
                 continue
             visited_socio_keys.add(key_id)
 
@@ -1719,12 +1905,25 @@ def answer_relationship_query(conn, query, llm_model=None, progress_callback=Non
 
     rows = []
     for idx, path in enumerate(paths, start=1):
-        strengths = [
-            node.get("key", {}).get("strength")
-            for node in path
-            if node.get("type") == "socio"
-        ]
-        confidence = "forte" if strengths and all(item == "forte" for item in strengths) else "indicio"
+        strengths = []
+
+        for node in path:
+
+            if node.get("type") != "socio":
+                continue
+
+            key = node.get("key") or ""
+
+            if "|" in key:
+                strengths.append("forte")
+            else:
+                strengths.append("indicio")
+
+        confidence = (
+            "forte"
+            if strengths and all(item == "forte" for item in strengths)
+            else "indicio"
+        )
         rows.append([idx, _path_company_depth(path), confidence, _format_relationship_path(path)])
 
     evidence.append(
@@ -2048,18 +2247,84 @@ def _execute_llm_intent(conn, query, intent):
     cnpj = filters.get("cnpj") or _cnpj_digits(query)
     cnpj_basico = filters.get("cnpj_basico") or (cnpj[:8] if cnpj else None)
 
-    if name == "get_cnpj" and cnpj:
-        row = _query_by_cnpj(conn, cnpj)
-        if row is None:
-            return "Nao encontrei esse CNPJ na base SQLite carregada.", evidence, True
-        return _format_cnpj_detail(row, conn=conn), evidence, True
+    if name == "get_cnpj":
 
-    if name == "get_socios" and cnpj_basico:
-        socios = _query_socios(conn, cnpj_basico, limit)
-        if not socios:
-            return "Nao encontrei socios para esse CNPJ/CNPJ basico.", evidence, True
-        answer = "Encontrei os seguintes registros no QSA da empresa:\n\n" + _format_socios_rows(socios)
-        return answer, evidence, True
+        multiple_cnpjs = _extract_multiple_cnpjs(query)
+
+        if len(multiple_cnpjs) > 1:
+
+            rows = _query_multiple_cnpjs(conn, multiple_cnpjs)
+
+            if not rows:
+                return (
+                    "Nao encontrei os CNPJs informados na base SQLite carregada.",
+                    evidence,
+                    True,
+                )
+
+            answer = (
+                f"Encontrei {len(rows)} empresa(s) na base CNPJ.\n\n"
+                + _format_multiple_cnpjs(conn, rows)
+            )
+
+            return answer, evidence, True
+
+        elif cnpj:
+
+            row = _query_by_cnpj(conn, cnpj)
+
+            if row is None:
+                return (
+                    "Nao encontrei esse CNPJ na base SQLite carregada.",
+                    evidence,
+                    True,
+                )
+
+            return _format_cnpj_detail(row, conn=conn), evidence, True
+
+    if name == "get_socios":
+
+        multiple_cnpjs = _extract_multiple_cnpjs(query)
+
+        if len(multiple_cnpjs) > 1:
+
+            rows = _query_multiple_socios(
+                conn,
+                multiple_cnpjs,
+                limit=max(limit * 20, 500),
+            )
+
+            if not rows:
+                return (
+                    "Nao encontrei socios para os CNPJs informados.",
+                    evidence,
+                    True,
+                )
+
+            answer = (
+                f"Encontrei {len(rows)} registro(s) de socios/administradores.\n\n"
+                + _format_multiple_socios(rows)
+            )
+
+            return answer, evidence, True
+
+        elif cnpj_basico:
+
+            socios = _query_socios(conn, cnpj_basico, limit)
+
+            if not socios:
+                return (
+                    "Nao encontrei socios para esse CNPJ/CNPJ basico.",
+                    evidence,
+                    True,
+                )
+
+            answer = (
+                "Encontrei os seguintes registros no QSA da empresa:\n\n"
+                + _format_socios_rows(socios)
+            )
+
+            return answer, evidence, True
 
     if name == "search_company" and filters.get("name"):
         rows, _ = _search_by_name(conn, filters["name"], limit)
@@ -2086,17 +2351,50 @@ def _execute_llm_intent(conn, query, intent):
     return None, evidence, False
 
 
-def _md_table(headers, rows):
-    if not rows:
-        return ""
-    header_line = "| " + " | ".join(headers) + " |"
-    sep_line = "| " + " | ".join("---" for _ in headers) + " |"
-    data_lines = [
-        "| " + " | ".join(str(value or "") for value in row) + " |"
-        for row in rows
-    ]
-    return "\n".join([header_line, sep_line, *data_lines])
 
+
+def _answer_cnpj_schema(conn, limit=80):
+    schema = discover_sqlite_schema(conn, max_tables=limit)
+    rows = []
+    for table in schema:
+        columns = table.get("columns") or []
+        rows.append([
+            table["table"],
+            table.get("description", ""),
+            len(columns),
+            ", ".join(col["name"] for col in columns[:12]),
+        ])
+    if not rows:
+        return "Nao encontrei tabelas no SQLite CNPJ."
+    return _md_table(["Tabela", "Descricao", "Colunas", "Primeiras colunas"], rows)
+
+
+def _answer_cnpj_tables(conn, limit=80):
+    rows = conn.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type='table'
+          AND name NOT LIKE 'sqlite_%'
+        ORDER BY name
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+
+    if not rows:
+        return "Nao encontrei tabelas no SQLite CNPJ."
+
+    table_rows = []
+    for row in rows:
+        name = row["name"]
+        try:
+            total = conn.execute(f'SELECT COUNT(*) AS total FROM "{name}"').fetchone()["total"]
+        except Exception:
+            total = ""
+        table_rows.append([name, total])
+
+    return _md_table(["Tabela", "Linhas"], table_rows)
 
 def _row_value(row, key):
     return row[key] if key in row.keys() else ""
@@ -2162,7 +2460,37 @@ def _format_socios_rows(rows):
         ],
     )
 
+def _format_multiple_socios(rows):
 
+    if not rows:
+        return "Nenhum socio encontrado."
+
+    table_rows = []
+
+    for row in rows:
+
+        table_rows.append([
+            row["razao_social"] or "",
+            row["nome_socio_razao_social"] or "",
+            row["cpf_cnpj_socio"] or "",
+            row["qualificacao_socio"] or "",
+            row["data_entrada_sociedade"] or "",
+            row["nome_representante"] or "",
+            row["faixa_etaria"] or "",
+        ])
+
+    return _md_table(
+        [
+            "Empresa",
+            "Socio/administrador",
+            "CPF/CNPJ",
+            "Qualificacao",
+            "Entrada",
+            "Representante",
+            "Faixa etaria",
+        ],
+        table_rows,
+    )
 def _format_person_company_rows(conn, rows):
     if not rows:
         return ""
@@ -2220,7 +2548,44 @@ def _format_cnpj_detail(row, conn=None):
         f"**E-mail:** {row['correio_eletronico'] or 'Nao informado'}",
     ]
     return "\n\n".join(lines)
+def _format_multiple_cnpjs(conn, rows):
+    if not rows:
+        return "Nenhum CNPJ encontrado."
 
+    table_rows = []
+
+    for row in rows:
+        cnpj = _format_cnpj(
+            row["cnpj_basico"],
+            row["cnpj_ordem"],
+            row["cnpj_dv"],
+        )
+
+        table_rows.append([
+            cnpj,
+            row["razao_social"] or "",
+            row["nome_fantasia"] or "",
+            SITUACAO_LABELS.get(
+                str(row["situacao_cadastral"]).zfill(2),
+                row["situacao_cadastral"] or "",
+            ),
+            row["uf"] or "",
+            row["municipio"] or "",
+            _format_cnae(conn, row["cnae_fiscal_principal"]),
+        ])
+
+    return _md_table(
+        [
+            "CNPJ",
+            "Razao social",
+            "Nome fantasia",
+            "Situacao",
+            "UF",
+            "Municipio",
+            "CNAE principal",
+        ],
+        table_rows,
+    )
 
 def answer_cnpj_query(
     query,
@@ -2253,6 +2618,33 @@ def answer_cnpj_query(
         cnpj = _cnpj_digits(query)
         cnpj_basico = cnpj[:8] if cnpj else _cnpj_basico_digits(query)
         evidence = [f"Banco consultado: `{path}`"]
+        if any(term in qn for term in ("schema", "esquema", "estrutura", "colunas", "dicionario", "dicionário")):
+            answer = _answer_cnpj_schema(conn, limit=limit)
+            final_output = (
+                f"# Resposta\n\n{answer}\n\n"
+                "---\n\n"
+                "# Evidencia\n\n"
+                + "\n\n".join(f"- {item}" for item in evidence)
+            )
+            return final_output, [], {
+                "strategy": "cnpj_schema",
+                "db_path": str(path),
+                "found": True,
+            }
+
+        if "tabela" in qn or "tabelas" in qn:
+            answer = _answer_cnpj_tables(conn, limit=limit)
+            final_output = (
+                f"# Resposta\n\n{answer}\n\n"
+                "---\n\n"
+                "# Evidencia\n\n"
+                + "\n\n".join(f"- {item}" for item in evidence)
+            )
+            return final_output, [], {
+                "strategy": "cnpj_tables",
+                "db_path": str(path),
+                "found": True,
+            }
 
         if is_company_links_query(query):
             answer, links_evidence, handled = answer_company_links_query(
@@ -2338,6 +2730,38 @@ def answer_cnpj_query(
                     "db_path": str(path),
                     "found": True,
                 }
+
+        try:
+            answer, agent_evidence, agent_meta = answer_sql_agent_query(
+                conn,
+                query,
+                llm_model=llm_model,
+                limit=max(limit, 100),
+                progress_callback=progress_callback,
+            )
+
+            evidence.extend(agent_evidence or [])
+            evidence.append("Consulta CNPJ interpretada pelo SQL Agent.")
+
+            final_output = (
+                f"# Resposta\n\n{answer}\n\n"
+                "---\n\n"
+                "# Evidencia\n\n"
+                + "\n\n".join(f"- {item}" for item in evidence)
+            )
+
+            routing = {
+                "strategy": "cnpj_sql_agent",
+                "db_path": str(path),
+                "found": True,
+            }
+            if agent_meta:
+                routing["sql_agent"] = agent_meta
+
+            return final_output, [], routing
+
+        except Exception as exc:
+            evidence.append(f"SQL Agent CNPJ indisponivel; fallback para fluxo especializado: {exc}")
 
         if use_llm_intent:
             intent = _llm_cnpj_intent(
