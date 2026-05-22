@@ -1488,6 +1488,7 @@ def ask(
     custom_prompt=None,
     allowed_docs=None,
     progress_callback=None,
+    memory_context=None,
 ):
     config = RAG_CONFIG.copy()
     if config_override:
@@ -1784,6 +1785,7 @@ def ask(
     prompt_vars = {
         "query": query,
         "context": context,
+        "memory_context": memory_context or "Nenhuma memoria conversacional relevante.",
         "ano_referencia": temporal_intent.get("year"),
         "recorte_temporal": _reference_label_from_intent(temporal_intent),
         "data_corte_temporal": _reference_search_hint_from_intent(temporal_intent) or "nao informado",
@@ -1817,6 +1819,13 @@ def ask(
         prompt = _format_prompt_template(custom_prompt_clean, prompt_vars)
     else:
         prompt = _format_prompt_template(DEFAULT_PROMPT_TEMPLATE, prompt_vars)
+
+    if memory_context:
+        prompt += (
+            "\n\n---\n\n"
+            "Memoria conversacional relevante:\n"
+            f"{memory_context}"
+        )
 
     if not temporal_gate_block:
         t_llm = time.time()
@@ -1874,6 +1883,7 @@ def ask_multi_base(
     custom_prompt=None,
     allowed_docs_by_base=None,
     progress_callback=None,
+    memory_context=None,
 ):
     base_names = [str(base).strip() for base in (base_names or []) if str(base).strip()]
     if not base_names:
@@ -2131,6 +2141,7 @@ def ask_multi_base(
     prompt_vars = {
         "query": query,
         "context": context,
+        "memory_context": memory_context or "Nenhuma memoria conversacional relevante.",
         "ano_referencia": temporal_intent.get("year"),
         "recorte_temporal": _reference_label_from_intent(temporal_intent),
         "data_corte_temporal": _reference_search_hint_from_intent(temporal_intent) or "nao informado",
@@ -2164,6 +2175,13 @@ def ask_multi_base(
         prompt = _format_prompt_template(custom_prompt_clean, prompt_vars)
     else:
         prompt = _format_prompt_template(DEFAULT_PROMPT_TEMPLATE, prompt_vars)
+
+    if memory_context:
+        prompt += (
+            "\n\n---\n\n"
+            "Memoria conversacional relevante:\n"
+            f"{memory_context}"
+        )
 
     if not temporal_gate_block:
         t_llm = time.time()

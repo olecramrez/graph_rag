@@ -73,6 +73,13 @@ from src.sql_agent import compact_schema_for_prompt
 from src.command_router import parse_route_command
 from src.lia_client import LIAClientError, chat_completion
 from src.safe_jsonl import load_valid_jsonl
+from src.conversation_memory import (
+    append_conversation_turn,
+    append_memory_summary,
+    build_memory_context,
+    clear_memory,
+    memory_stats,
+)
 from src.positional_index import load_positional_index, search
 from src.lexical_filter import (
     parse_boolean_query,
@@ -2158,6 +2165,13 @@ defaults = {
     "prompt_template_choice_pending": None,
     "prompt_save_name": "",
     "prompt_save_feedback": None,
+    "memory_enabled": True,
+    "memory_short_enabled": True,
+    "memory_persistent_enabled": True,
+    "memory_auto_summarize": True,
+    "memory_short_turns": 4,
+    "memory_retrieval_limit": 5,
+    "memory_clear_feedback": None,
 }
 
 RAG_UI_STATE_KEYS = [
@@ -3347,6 +3361,64 @@ with config_col:
     )
 
     st.markdown("---")
+    st.markdown("## Memoria")
+
+    memory_feedback = st.session_state.pop("memory_clear_feedback", None)
+    if memory_feedback:
+        st.success(memory_feedback)
+
+    st.checkbox(
+        "Usar memoria nas respostas",
+        key="memory_enabled",
+        help="Inclui memoria curta, resumos persistentes e recuperacao por similaridade no contexto do RAG.",
+    )
+    memory_disabled = not bool(st.session_state.get("memory_enabled"))
+    st.checkbox(
+        "Memoria curta da conversa atual",
+        key="memory_short_enabled",
+        disabled=memory_disabled,
+    )
+    st.checkbox(
+        "Memoria persistente recuperavel",
+        key="memory_persistent_enabled",
+        disabled=memory_disabled,
+    )
+    st.checkbox(
+        "Gerar resumo persistente apos cada resposta",
+        key="memory_auto_summarize",
+        disabled=memory_disabled,
+    )
+    st.slider(
+        "Turnos recentes",
+        1,
+        10,
+        key="memory_short_turns",
+        disabled=memory_disabled or not st.session_state.get("memory_short_enabled"),
+    )
+    st.slider(
+        "Memorias recuperadas",
+        1,
+        12,
+        key="memory_retrieval_limit",
+        disabled=memory_disabled or not st.session_state.get("memory_persistent_enabled"),
+    )
+    try:
+        stats = memory_stats()
+        st.caption(
+            f"Memoria salva: {stats['turns']} conversa(s), "
+            f"{stats['summaries']} resumo(s)."
+        )
+    except Exception as exc:
+        st.caption(f"Memoria indisponivel: {exc}")
+
+    if st.button("Limpar memoria persistente"):
+        removed = clear_memory()
+        st.session_state.memory_clear_feedback = (
+            f"Memoria limpa ({len(removed)} arquivo(s) removido(s))."
+        )
+        st.rerun()
+
+    st.markdown("---")
     st.markdown("## \U0001F9E0 Prompt do Sistema")
 
     prompt_save_feedback = st.session_state.pop("prompt_save_feedback", None)
@@ -3534,6 +3606,30 @@ with main_col:
         if search_route.get("source") != "command" and routed_rag_query != original_query_for_log:
             on_timing(f"[QUERY][ROUTER] Consulta RAG sugerida: {_short_log_text(routed_rag_query)}")
 
+        memory_context = ""
+        memory_meta = {"enabled": False, "short_turns": 0, "retrieved": 0}
+        if st.session_state.get("memory_enabled"):
+            try:
+                memory_context, memory_meta = build_memory_context(
+                    routed_rag_query or query_for_rag,
+                    chat_history=st.session_state.get("chat_history", []),
+                    short_turns=st.session_state.get("memory_short_turns", 4),
+                    retrieval_limit=st.session_state.get("memory_retrieval_limit", 5),
+                    base=base,
+                    include_short=st.session_state.get("memory_short_enabled", True),
+                    include_persistent=st.session_state.get("memory_persistent_enabled", True),
+                )
+                memory_meta["enabled"] = True
+                on_timing(
+                    "[INFO] Memoria: "
+                    f"{memory_meta.get('short_turns', 0)} turno(s) recentes; "
+                    f"{memory_meta.get('retrieved', 0)} memoria(s) persistente(s)."
+                )
+            except Exception as exc:
+                memory_context = ""
+                memory_meta = {"enabled": False, "error": str(exc)}
+                on_timing(f"[WARN] Memoria indisponivel: {exc}")
+
         try:
             if route_name == "sqlite_only":
                 if status_box is not None:
@@ -3584,6 +3680,7 @@ with main_col:
                         custom_prompt=st.session_state.prompt_custom,
                         allowed_docs_by_base=allowed_docs_scope,
                         progress_callback=on_timing,
+                        memory_context=memory_context,
                     )
                 else:
                     if status_box is not None:
@@ -3596,7 +3693,8 @@ with main_col:
                             config_override=config_override,
                             custom_prompt=st.session_state.prompt_custom,
                             allowed_docs=allowed_docs_scope,
-                            progress_callback=on_timing
+                            progress_callback=on_timing,
+                            memory_context=memory_context,
                         )
                     else:
                         with st.spinner("\U0001F6E2 Processando consulta tecnica..."):
@@ -3609,7 +3707,8 @@ with main_col:
                                 config_override=config_override,
                                 custom_prompt=st.session_state.prompt_custom,
                                 allowed_docs=allowed_docs_scope,
-                                progress_callback=on_timing
+                                progress_callback=on_timing,
+                                memory_context=memory_context,
                             )
 
                 resposta_completa = join_hybrid_outputs(cnpj_output, rag_output)
@@ -3641,6 +3740,7 @@ with main_col:
                         custom_prompt=st.session_state.prompt_custom,
                         allowed_docs_by_base=allowed_docs_scope,
                         progress_callback=on_timing,
+                        memory_context=memory_context,
                     )
                 else:
                     rag_output, rag_reranked, rag_routing = ask(
@@ -3652,7 +3752,8 @@ with main_col:
                         config_override=config_override,
                         custom_prompt=st.session_state.prompt_custom,
                         allowed_docs=allowed_docs_scope,
-                        progress_callback=on_timing
+                        progress_callback=on_timing,
+                        memory_context=memory_context,
                     )
 
                 rag_answer_text, _ = split_answer_and_evidence(rag_output)
@@ -3719,6 +3820,7 @@ with main_col:
                     custom_prompt=st.session_state.prompt_custom,
                     allowed_docs_by_base=allowed_docs_scope,
                     progress_callback=on_timing,
+                    memory_context=memory_context,
                 )
                 routing["route_source"] = search_route.get("source")
                 routing["route_reason"] = search_route.get("reason")
@@ -3734,7 +3836,8 @@ with main_col:
                         config_override=config_override,
                         custom_prompt=st.session_state.prompt_custom,
                         allowed_docs=allowed_docs_scope,
-                        progress_callback=on_timing
+                        progress_callback=on_timing,
+                        memory_context=memory_context,
                     )
                 else:
                     with st.spinner("\U0001F6E2 Processando consulta tecnica..."):
@@ -3747,7 +3850,8 @@ with main_col:
                             config_override=config_override,
                             custom_prompt=st.session_state.prompt_custom,
                             allowed_docs=allowed_docs_scope,
-                            progress_callback=on_timing
+                            progress_callback=on_timing,
+                            memory_context=memory_context,
                         )
                 routing["route_source"] = search_route.get("source")
                 routing["route_reason"] = search_route.get("reason")
@@ -3808,8 +3912,37 @@ with main_col:
             "timings": timing_lines,
             "base": ", ".join(selected_bases or []) if st.session_state.get("multi_base_enabled") else base,
             "modo": modo_final,
-            "timestamp": timestamp
+            "timestamp": timestamp,
+            "memory": memory_meta,
         })
+
+        if st.session_state.get("memory_enabled"):
+            try:
+                memory_base = (
+                    ", ".join(selected_bases or [])
+                    if st.session_state.get("multi_base_enabled")
+                    else base
+                )
+                append_conversation_turn(
+                    query,
+                    resposta_texto,
+                    base=memory_base,
+                    mode=modo_final,
+                    metadata={
+                        "route": route_name,
+                        "memory": memory_meta,
+                    },
+                )
+                if st.session_state.get("memory_auto_summarize"):
+                    append_memory_summary(
+                        query,
+                        resposta_texto,
+                        base=memory_base,
+                        mode=modo_final,
+                        llm_model=final_llm_model,
+                    )
+            except Exception as exc:
+                st.warning(f"Nao foi possivel salvar memoria: {exc}")
 
         st.rerun()
 
