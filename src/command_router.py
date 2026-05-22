@@ -8,6 +8,9 @@ COMMAND_ALIASES = {
     "minera": "anm",
     "mineracao": "anm",
     "mineração": "anm",
+    "sqlite": "sqlite",
+    "sql": "sqlite",
+    "base": "sqlite",
     "rag": "rag",
 }
 

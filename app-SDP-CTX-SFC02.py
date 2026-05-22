@@ -53,7 +53,6 @@ from src.config import (
     DEFAULT_SHARED_BASE_ROOT,
     get_available_bases,
     get_chunks_path,
-    get_sqlite_files,
     get_raw_dir,
     USER_ENV,
     get_user_exports_dir,
@@ -66,11 +65,6 @@ from src.config import (
 
 from src.rag_pipeline import ask, ask_multi_base, DEFAULT_PROMPT_TEMPLATE
 from src.cnpj_query import answer_cnpj_query, is_cnpj_query
-from src.anm_query import answer_anm_query
-from src.universal_sqlite_query import answer_universal_sqlite_query
-from src.sqlite_schema_library import load_or_build_schema_profile
-from src.sql_agent import compact_schema_for_prompt
-from src.command_router import parse_route_command
 from src.lia_client import LIAClientError, chat_completion
 from src.safe_jsonl import load_valid_jsonl
 from src.positional_index import load_positional_index, search
@@ -1301,7 +1295,7 @@ def join_hybrid_outputs(cnpj_output, rag_output):
     )
 
 
-ALLOWED_SEARCH_ROUTES = {"cnpj_only", "anm_only", "sqlite_only", "rag_only", "cnpj_rag_hybrid", "rag_cnpj_hybrid"}
+ALLOWED_SEARCH_ROUTES = {"cnpj_only", "rag_only", "cnpj_rag_hybrid", "rag_cnpj_hybrid"}
 
 
 def fallback_search_route(query):
@@ -1344,15 +1338,13 @@ def _extract_json_payload(text):
     raise ValueError("Roteador nao retornou JSON valido.")
 
 
-def sanitize_search_route(payload, query, sqlite_available=False):
+def sanitize_search_route(payload, query):
     if not isinstance(payload, dict):
         return None
 
     route = str(payload.get("route") or "").strip()
     if route not in ALLOWED_SEARCH_ROUTES:
         return None
-    if route == "sqlite_only" and not sqlite_available:
-        route = "rag_only"
 
     has_cnpj_signal = is_cnpj_query(query)
     if route in {"cnpj_only", "cnpj_rag_hybrid"} and not has_cnpj_signal:
@@ -1374,60 +1366,8 @@ def sanitize_search_route(payload, query, sqlite_available=False):
     }
 
 
-@st.cache_data(show_spinner=False)
-def build_sqlite_router_context(sqlite_db_path, base_name, sqlite_mtime):
-    if not sqlite_db_path:
-        return ""
-    profile, _ = load_or_build_schema_profile(sqlite_db_path, base_name=base_name)
-    schema = profile.get("schema") or []
-    schema_text = compact_schema_for_prompt(schema, max_tables=12, max_columns=18)
-    dictionary_entries = profile.get("dictionary_entries") or 0
-    dictionary_note = (
-        f"Dicionario incorporado: {dictionary_entries} campo(s)."
-        if dictionary_entries
-        else "Sem dicionario incorporado."
-    )
-    return (
-        f"SQLite selecionado: {profile.get('db_name')}\n"
-        f"{dictionary_note}\n"
-        f"Resumo do schema/dicionario:\n{schema_text[:10000]}"
-    )
-
-
-def choose_search_route(
-    query,
-    llm_model=None,
-    progress_callback=None,
-    sqlite_db_path=None,
-    sqlite_base_name=None,
-):
-    command_route, command_query = parse_route_command(query)
-    if command_route:
-        route = {
-            "route": f"{command_route}_only",
-            "reason": f"Comando explicito @{command_route}.",
-            "rag_query": command_query or str(query or "").strip(),
-            "source": "command",
-        }
-        if progress_callback:
-            progress_callback(f"[INFO] Roteador por comando: {route['route']} - {route['reason']}")
-        return route
-
+def choose_search_route(query, llm_model=None, progress_callback=None):
     fallback = fallback_search_route(query)
-    sqlite_context = ""
-    sqlite_available = bool(sqlite_db_path)
-    if sqlite_available:
-        try:
-            sqlite_mtime = Path(sqlite_db_path).stat().st_mtime
-            sqlite_context = build_sqlite_router_context(
-                str(sqlite_db_path),
-                sqlite_base_name or "",
-                sqlite_mtime,
-            )
-        except Exception as exc:
-            sqlite_available = False
-            if progress_callback:
-                progress_callback(f"[WARN] Schema SQLite indisponivel para o router LLM: {exc}")
 
     prompt = f"""
 Escolha a melhor rota de busca para a pergunta do usuario.
@@ -1435,7 +1375,6 @@ Responda somente JSON puro, sem markdown.
 
 Rotas permitidas:
 - cnpj_only: usar apenas a base SQLite CNPJ para dados cadastrais, socios, CNAE, situacao, nome fantasia ou razao social.
-- sqlite_only: usar apenas o SQLite generico selecionado para a base ativa quando a pergunta puder ser respondida por tabelas/colunas do schema SQLite abaixo, inclusive perguntas sobre dicionario/codigos de campos.
 - rag_only: usar apenas as bases RAG/documentos.
 - cnpj_rag_hybrid: consultar CNPJ primeiro e depois usar os dados cadastrais como insumo para buscar evidencias nas bases RAG.
 - rag_cnpj_hybrid: consultar documentos/RAG primeiro e depois usar empresas, CNPJs ou pessoas encontrados para consultar CNPJ/QSA.
@@ -1444,15 +1383,10 @@ Regras:
 - Se a pergunta pede dados cadastrais, QSA, socios, administrador, representante, endereco, situacao cadastral, CNAE, porte, capital social, quadro societario, vinculo/vinculacao societaria ou "todas as informacoes" de uma empresa/pessoa, escolha cnpj_only.
 - Se a pergunta pede se uma empresa tem vinculacao/ligacao/conexao com outras empresas por socios, escolha cnpj_only.
 - Se a pergunta pede se uma pessoa tem empresa, e socio de empresa ou tem empresa em uma UF, escolha cnpj_only e use QSA/socios, nao busca textual por razao social.
-- Se houver SQLite selecionado e a pergunta menciona campos, colunas, codigos, indicadores, tabelas, agentes, anos, totais, rankings, amostras, agregacoes ou termos presentes no schema/dicionario abaixo, escolha sqlite_only.
-- Se a pergunta pede "o que significa", "o que e", "traduza", "codigo X" ou "numero X" sobre campo do dicionario, escolha sqlite_only.
 - Se a pergunta pede documentos, evidencias, normas, mencoes, relacao com bases ou verificacao no RAG sobre uma empresa/CNPJ, escolha cnpj_rag_hybrid.
 - Se a pergunta manda procurar primeiro nos chunks/documentos/bases e depois consultar CNPJ com os achados, escolha rag_cnpj_hybrid.
 - Se nao houver tema de CNPJ, escolha rag_only.
 - Nao escreva SQL.
-
-Contexto SQLite disponivel:
-{sqlite_context or "Nenhum SQLite selecionado para roteamento."}
 
 Formato:
 {{
@@ -1481,11 +1415,7 @@ Pergunta:
             max_retries=2,
             llm_model=llm_model,
         )
-        route = sanitize_search_route(
-            _extract_json_payload(raw),
-            query,
-            sqlite_available=sqlite_available,
-        )
+        route = sanitize_search_route(_extract_json_payload(raw), query)
         if route:
             if progress_callback:
                 progress_callback(
@@ -2135,7 +2065,6 @@ defaults = {
     "modo_busca": "Nome do documento",
     "doc_forcado": None,
     "modo_consulta": "Automatico (Router Inteligente)",
-    "sqlite_db_choice": "",
     "last_export_xlsx": None,
     "last_export_pdf": None,
     "last_cited_export_xlsx": None,
@@ -2427,7 +2356,6 @@ if st.session_state.last_base != base:
     st.session_state.content_filters_version += 1
     st.session_state.modo_busca = "Nome do documento"
     st.session_state.doc_forcado = None
-    st.session_state.sqlite_db_choice = ""
     st.session_state.last_export_xlsx = None
     st.session_state.last_export_pdf = None
     st.session_state.last_cited_export_xlsx = None
@@ -2609,34 +2537,12 @@ modo_consulta = st.sidebar.radio(
     [
         "Automatico (Router Inteligente)",
         "Forcar Busca Global",
-        "Forcar Documento Especifico",
-        "Somente SQLite da base"
+        "Forcar Documento Especifico"
     ],
     key="modo_consulta"
 )
 
 doc_forcado = None
-sqlite_files = get_sqlite_files(base)
-selected_sqlite_path = None
-
-if sqlite_files:
-    sqlite_options = [str(path) for path in sqlite_files]
-    current_sqlite = st.session_state.get("sqlite_db_choice")
-    if current_sqlite not in sqlite_options:
-        st.session_state.sqlite_db_choice = sqlite_options[0]
-    selected_sqlite_path = Path(
-        st.sidebar.selectbox(
-            "SQLite da base",
-            sqlite_options,
-            key="sqlite_db_choice",
-            format_func=lambda value: Path(value).name,
-            help="Usado no modo 'Somente SQLite da base' e nos comandos @sqlite/@sql.",
-        )
-    )
-else:
-    st.session_state.sqlite_db_choice = ""
-    if modo_consulta == "Somente SQLite da base":
-        st.sidebar.warning("Nenhum SQLite encontrado em base_rag/data desta base. Use o app4 para criar.")
 
 if modo_consulta == "Forcar Documento Especifico":
 
@@ -3514,44 +3420,14 @@ with main_col:
             query_for_rag,
             llm_model=final_llm_model,
             progress_callback=on_timing,
-            sqlite_db_path=selected_sqlite_path,
-            sqlite_base_name=base,
         )
         route_name = search_route.get("route") or "rag_only"
         routed_rag_query = search_route.get("rag_query") or query_for_rag
-        if modo_consulta == "Somente SQLite da base":
-            route_name = "sqlite_only"
-            routed_rag_query = query_for_rag
-            search_route = {
-                "route": route_name,
-                "reason": "Modo de consulta forçado para SQLite da base.",
-                "rag_query": query_for_rag,
-                "source": "mode",
-            }
-        original_query_for_log = query_for_rag
-        if search_route.get("source") == "command":
-            query_for_rag = routed_rag_query or query_for_rag
-        if search_route.get("source") != "command" and routed_rag_query != original_query_for_log:
+        if routed_rag_query != query_for_rag:
             on_timing(f"[QUERY][ROUTER] Consulta RAG sugerida: {_short_log_text(routed_rag_query)}")
 
         try:
-            if route_name == "sqlite_only":
-                if status_box is not None:
-                    status_box.write(
-                        ":blue[[INFO] Pergunta roteada para SQLite generico da base.]"
-                    )
-                on_timing("[INFO] Consulta SQLite da base")
-                on_timing(f"[QUERY][SQLITE] {_short_log_text(query_for_rag)}")
-                resposta_completa, reranked, routing = answer_universal_sqlite_query(
-                    query_for_rag,
-                    db_path=selected_sqlite_path,
-                    llm_model=final_llm_model,
-                    progress_callback=on_timing,
-                    label=base,
-                )
-                routing["route_source"] = search_route.get("source")
-                routing["route_reason"] = search_route.get("reason")
-            elif route_name == "cnpj_rag_hybrid":
+            if route_name == "cnpj_rag_hybrid":
                 if status_box is not None:
                     status_box.write(
                         ":blue[[INFO] Pergunta hibrida: CNPJ SQLite + bases RAG.]"
@@ -3687,20 +3563,6 @@ with main_col:
                 )
                 routing["route_source"] = search_route.get("source")
                 routing["route_reason"] = search_route.get("reason")
-            elif route_name == "anm_only":
-                if status_box is not None:
-                    status_box.write(
-                        ":blue[[INFO] Pergunta roteada para base ANM SQLite.]"
-                    )
-                on_timing("[INFO] Consulta ANM SQLite")
-                on_timing(f"[QUERY][ANM] {_short_log_text(query_for_rag)}")
-                resposta_completa, reranked, routing = answer_anm_query(
-                    query_for_rag,
-                    llm_model=final_llm_model,
-                    progress_callback=on_timing,
-                )
-                routing["route_source"] = search_route.get("source")
-                routing["route_reason"] = search_route.get("reason")
             elif st.session_state.get("multi_base_enabled"):
                 bases_para_consulta = list(selected_bases or [])
 
@@ -3789,10 +3651,6 @@ with main_col:
             modo_final = "CNPJ Perfil cadastral"
         elif routing.get("strategy") in {"cnpj_sqlite", "cnpj_sqlite_llm_intent"}:
             modo_final = "CNPJ SQLite"
-        elif routing.get("strategy") == "anm_sqlite":
-            modo_final = "ANM SQLite"
-        elif routing.get("strategy") == "sqlite_universal":
-            modo_final = "SQLite da base"
         elif st.session_state.get("multi_base_enabled"):
             modo_final = "Multibase"
         elif modo_consulta == "Forcar Documento Especifico":

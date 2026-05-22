@@ -234,21 +234,6 @@ def get_data_dir(base_name=None):
     return get_persistent_data_dir(base_name)
 
 
-def get_sqlite_files(base_name=None):
-    data_dir = get_persistent_data_dir(base_name)
-    patterns = ("*.sqlite", "*.sqlite3", "*.db")
-    files = []
-    for pattern in patterns:
-        try:
-            files.extend(data_dir.glob(pattern))
-        except OSError:
-            pass
-    return sorted(
-        {path.resolve() for path in files if path.is_file()},
-        key=lambda item: item.name.lower(),
-    )
-
-
 # Compatibilidade com codigo legado: "raw_docs" agora aponta
 # para os documentos de origem na rede (sem copia local de PDFs).
 def get_raw_dir(base_name=None):
@@ -339,48 +324,3 @@ def get_cnpj_db_path():
         except OSError:
             continue
     return get_persistent_data_dir("cnpj") / "cnpj.sqlite"
-
-
-def get_anm_db_candidates():
-    candidates = []
-
-    env_path = (os.getenv("ANM_SQLITE_PATH") or os.getenv("ANM_DADOS_GOV_SQLITE_PATH") or "").strip()
-    if env_path:
-        path = Path(env_path)
-        if not path.is_absolute():
-            path = PROJECT_ROOT / path
-        candidates.append(path)
-
-    anm_data_dir = get_persistent_data_dir("anm_dados_gov")
-    candidates.extend(
-        [
-            anm_data_dir / "anm_dados_gov.sqlite",
-            PROJECT_ROOT / "data_anm" / "anm_dados_gov.sqlite",
-            PROJECT_ROOT / "data_anm" / "anm.sqlite",
-        ]
-    )
-
-    for root in (anm_data_dir, PROJECT_ROOT / "data_anm"):
-        try:
-            candidates.extend(sorted(root.glob("*.sqlite"), reverse=True))
-        except OSError:
-            pass
-
-    unique = []
-    seen = set()
-    for path in candidates:
-        key = str(path).lower()
-        if key not in seen:
-            seen.add(key)
-            unique.append(path)
-    return unique
-
-
-def get_anm_db_path():
-    for path in get_anm_db_candidates():
-        try:
-            if path.exists():
-                return path
-        except OSError:
-            continue
-    return get_persistent_data_dir("anm_dados_gov") / "anm_dados_gov.sqlite"

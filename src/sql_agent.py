@@ -36,9 +36,10 @@ ENTITY_TERMS = {
 
 
 def quote_identifier(name):
-    if not IDENTIFIER_RE.match(str(name or "")):
+    text = str(name or "")
+    if not text or "\x00" in text:
         raise ValueError(f"Identificador SQL invalido: {name}")
-    return '"' + name.replace('"', '""') + '"'
+    return '"' + text.replace('"', '""') + '"'
 
 
 def extract_json_object(text):
@@ -334,10 +335,27 @@ def compact_schema_for_prompt(schema, max_tables=30, max_columns=24):
     for table in schema[:max_tables]:
         columns = table.get("columns") or []
 
-        col_text = ", ".join(
-            f"{col['name']} {col.get('type') or ''}".strip()
-            for col in columns[:max_columns]
-        )
+        col_parts = []
+        for col in columns[:max_columns]:
+            part = f"{col['name']} {col.get('type') or ''}".strip()
+            details = []
+            if col.get("dictionary_type"):
+                details.append(f"tipo dicionario: {col.get('dictionary_type')}")
+            if col.get("description"):
+                details.append(str(col.get("description"))[:260])
+            if col.get("aliases"):
+                details.append("aliases: " + ", ".join(col.get("aliases")[:8]))
+            if col.get("value_map"):
+                value_items = list((col.get("value_map") or {}).items())[:12]
+                details.append(
+                    "codigos: "
+                    + "; ".join(f"{key}={value}" for key, value in value_items)
+                )
+            if details:
+                part += " (" + " | ".join(details) + ")"
+            col_parts.append(part)
+
+        col_text = ", ".join(col_parts)
 
         extra_text = ""
 
@@ -429,6 +447,7 @@ Regras obrigatorias:
 - Gere apenas uma consulta SELECT ou WITH.
 - Nunca use DROP, DELETE, UPDATE, INSERT, ALTER, ATTACH, DETACH, PRAGMA, VACUUM, CREATE.
 - Use somente tabelas e colunas presentes no schema.
+- Coloque nomes de tabelas e colunas entre aspas duplas quando tiverem acentos, espacos, hifens, caracteres especiais ou quando houver duvida.
 - Para substancias minerais, prefira buscas flexiveis usando LIKE.
 - Exemplo: UPPER(substância_mineral) LIKE '%FERRO%'.
 - Evite igualdade exata para nomes minerais.
@@ -608,8 +627,9 @@ def answer_sql_agent_query(
     timeout_seconds=8,
     progress_callback=None,
     consolidate=True,
+    schema=None,
 ):
-    schema = discover_sqlite_schema(conn)
+    schema = schema or discover_sqlite_schema(conn)
     entities = detect_entities(query)
     mode = classify_sql_question(query, entities)
     relevant_schema = select_relevant_schema(schema, query)
