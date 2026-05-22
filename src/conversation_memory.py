@@ -215,6 +215,85 @@ def build_short_memory(chat_history, max_turns=4, max_chars=3500):
     return _truncate("\n\n".join(parts), max_chars)
 
 
+def answer_conversation_meta_query(query, chat_history):
+    qn = _normalize(query)
+    history = list(chat_history or [])
+    if not qn or not history:
+        return None
+
+    last_item = history[-1]
+    previous_item = history[-2] if len(history) >= 2 else None
+
+    asks_last_question = any(
+        phrase in qn
+        for phrase in (
+            "qual foi minha ultima pergunta",
+            "qual foi a minha ultima pergunta",
+            "o que eu perguntei por ultimo",
+            "o que perguntei por ultimo",
+            "minha ultima pergunta",
+            "ultima pergunta que fiz",
+        )
+    )
+    if asks_last_question:
+        question = str(last_item.get("question") or "").strip()
+        if question:
+            return f"Sua ultima pergunta foi: \"{question}\"."
+        return "Nao encontrei uma pergunta anterior registrada nesta conversa."
+
+    asks_previous_question = any(
+        phrase in qn
+        for phrase in (
+            "qual foi minha pergunta anterior",
+            "qual foi a pergunta anterior",
+            "o que perguntei antes",
+            "pergunta anterior",
+        )
+    )
+    if asks_previous_question:
+        item = previous_item or last_item
+        question = str(item.get("question") or "").strip()
+        if question:
+            return f"A pergunta anterior foi: \"{question}\"."
+        return "Nao encontrei uma pergunta anterior registrada nesta conversa."
+
+    asks_last_answer = any(
+        phrase in qn
+        for phrase in (
+            "qual foi sua ultima resposta",
+            "qual foi a sua ultima resposta",
+            "sua ultima resposta",
+            "ultima resposta",
+            "o que voce respondeu por ultimo",
+        )
+    )
+    if asks_last_answer:
+        answer = str(last_item.get("answer") or "").strip()
+        if answer:
+            return "Minha ultima resposta foi:\n\n" + _truncate(answer, 2500)
+        return "Nao encontrei uma resposta anterior registrada nesta conversa."
+
+    asks_summary = any(
+        phrase in qn
+        for phrase in (
+            "resuma nossa conversa",
+            "resumo da conversa",
+            "resuma o que conversamos",
+            "o que conversamos ate agora",
+        )
+    )
+    if asks_summary:
+        recent = history[-6:]
+        lines = []
+        for idx, item in enumerate(recent, start=1):
+            question = _truncate(item.get("question", ""), 240)
+            answer = _truncate(item.get("answer", ""), 360)
+            lines.append(f"{idx}. Pergunta: {question}\n   Resposta: {answer}")
+        return "Resumo dos ultimos pontos da conversa:\n\n" + "\n\n".join(lines)
+
+    return None
+
+
 def build_memory_context(
     query,
     chat_history=None,

@@ -99,6 +99,25 @@ class ConversationMemoryTests(unittest.TestCase):
         self.assertEqual(sql, "SELECT 1")
         self.assertIn("preco medio anual do GLP em Guarulhos", captured["prompt"])
 
+    def test_answers_last_question_meta_query(self):
+        answer = memory.answer_conversation_meta_query(
+            "qual foi minha ultima pergunta?",
+            [
+                {"question": "e em florianopolis?", "answer": "120,04"},
+                {"question": "e para o etanol?", "answer": "sem resultados"},
+            ],
+        )
+
+        self.assertEqual(answer, 'Sua ultima pergunta foi: "e para o etanol?".')
+
+    def test_product_followup_is_not_meta_query(self):
+        answer = memory.answer_conversation_meta_query(
+            "e para o etanol?",
+            [{"question": "e em florianopolis?", "answer": "120,04"}],
+        )
+
+        self.assertIsNone(answer)
+
 
 if __name__ == "__main__":
     unittest.main()

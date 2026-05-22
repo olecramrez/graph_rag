@@ -76,6 +76,7 @@ from src.safe_jsonl import load_valid_jsonl
 from src.conversation_memory import (
     append_conversation_turn,
     append_memory_summary,
+    answer_conversation_meta_query,
     build_memory_context,
     clear_memory,
     memory_stats,
@@ -3537,6 +3538,37 @@ with main_col:
         query_for_rag, docs_directive = parse_docs_directive(query)
         if not query_for_rag.strip():
             query_for_rag = query
+
+        meta_answer = answer_conversation_meta_query(
+            query_for_rag,
+            st.session_state.get("chat_history", []),
+        )
+        if meta_answer:
+            timestamp = datetime.now().strftime("%d/%m/%Y %H:%M:%S")
+            timing_lines = [
+                "[INFO] Pergunta respondida pela memoria conversacional.",
+            ]
+            memory_meta = {
+                "enabled": bool(st.session_state.get("memory_enabled")),
+                "short_turns": min(
+                    len(st.session_state.get("chat_history", [])),
+                    int(st.session_state.get("memory_short_turns", 4)),
+                ),
+                "retrieved": 0,
+                "meta_query": True,
+            }
+            st.session_state.chat_history.append({
+                "question": query,
+                "answer": meta_answer,
+                "evidence": "",
+                "cited_docs": [],
+                "timings": timing_lines,
+                "base": "Conversa",
+                "modo": "Memoria",
+                "timestamp": timestamp,
+                "memory": memory_meta,
+            })
+            st.rerun()
 
         allowed_docs_scope, docs_directive_resolved, docs_directive_missing = (
             build_docs_directive_scope(docs_directive)
