@@ -3,6 +3,7 @@ import tempfile
 from unittest.mock import patch
 
 from src import conversation_memory as memory
+from src.sql_agent import generate_sql_with_llm
 
 
 class ConversationMemoryTests(unittest.TestCase):
@@ -71,6 +72,32 @@ class ConversationMemoryTests(unittest.TestCase):
         self.assertIn("Memoria persistente", context)
         self.assertEqual(meta["short_turns"], 1)
         self.assertEqual(meta["retrieved"], 1)
+
+    def test_sql_generation_receives_memory_context(self):
+        captured = {}
+
+        def fake_chat_completion(messages, temperature=0.0, llm_model=None, max_retries=5):
+            captured["prompt"] = messages[1]["content"]
+            return '{"sql": "SELECT 1", "reason": "teste"}'
+
+        with patch("src.sql_agent.chat_completion", side_effect=fake_chat_completion):
+            sql, _ = generate_sql_with_llm(
+                "e em Florianopolis?",
+                [
+                    {
+                        "table": "precos",
+                        "columns": [
+                            {"name": "municipio", "type": "TEXT"},
+                            {"name": "produto", "type": "TEXT"},
+                            {"name": "valor_de_venda", "type": "TEXT"},
+                        ],
+                    }
+                ],
+                memory_context="Pergunta anterior: preco medio anual do GLP em Guarulhos.",
+            )
+
+        self.assertEqual(sql, "SELECT 1")
+        self.assertIn("preco medio anual do GLP em Guarulhos", captured["prompt"])
 
 
 if __name__ == "__main__":

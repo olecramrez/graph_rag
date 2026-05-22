@@ -421,8 +421,9 @@ def select_relevant_schema(schema, query, max_tables=18):
     return selected or [table for _, table in scored[:max_tables]]
 
 
-def generate_sql_with_llm(query, schema, entities=None, llm_model=None):
+def generate_sql_with_llm(query, schema, entities=None, llm_model=None, memory_context=None):
     schema_text = compact_schema_for_prompt(schema)
+    entities = entities or {}
     entity_rules = []
     entity_rules_text = ""
     entity_rules_text = "\n".join(entity_rules)
@@ -475,6 +476,9 @@ Regras obrigatorias:
 
 Schema disponivel:
 {schema_text}
+
+Memoria conversacional relevante:
+{memory_context or "Nenhuma memoria conversacional relevante."}
 
 Entidades detectadas:
 {json.dumps(entities or {}, ensure_ascii=False)}
@@ -628,6 +632,7 @@ def answer_sql_agent_query(
     progress_callback=None,
     consolidate=True,
     schema=None,
+    memory_context=None,
 ):
     schema = schema or discover_sqlite_schema(conn)
     entities = detect_entities(query)
@@ -643,6 +648,7 @@ def answer_sql_agent_query(
             relevant_schema,
             entities=entities,
             llm_model=llm_model,
+            memory_context=memory_context,
         )
 
         if progress_callback:

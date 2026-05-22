@@ -260,7 +260,16 @@ def _is_feasibility_query(query):
     )
 
 
-def _answer_feasibility(conn, query, limit=80, llm_model=None, progress_callback=None, db_path=None, base_name=None):
+def _answer_feasibility(
+    conn,
+    query,
+    limit=80,
+    llm_model=None,
+    progress_callback=None,
+    db_path=None,
+    base_name=None,
+    memory_context=None,
+):
     schema = _get_schema(conn, db_path=db_path, limit=limit, base_name=base_name, progress_callback=progress_callback)
     relevant_schema = select_relevant_schema(schema, query, max_tables=12)
     schema_text = compact_schema_for_prompt(relevant_schema, max_tables=12, max_columns=30)
@@ -283,6 +292,9 @@ Responda em portugues com:
 Schema disponivel:
 {schema_text}
 
+Memoria conversacional relevante:
+{memory_context or "Nenhuma memoria conversacional relevante."}
+
 Pergunta do usuario:
 {query}
 """.strip()
@@ -303,7 +315,16 @@ Pergunta do usuario:
     return answer, evidence
 
 
-def _route_sqlite_query_with_llm(conn, query, limit=80, llm_model=None, progress_callback=None, db_path=None, base_name=None):
+def _route_sqlite_query_with_llm(
+    conn,
+    query,
+    limit=80,
+    llm_model=None,
+    progress_callback=None,
+    db_path=None,
+    base_name=None,
+    memory_context=None,
+):
     schema = _get_schema(conn, db_path=db_path, limit=limit, base_name=base_name, progress_callback=progress_callback)
     relevant_schema = select_relevant_schema(schema, query, max_tables=12)
     schema_text = compact_schema_for_prompt(relevant_schema, max_tables=12, max_columns=24)
@@ -330,6 +351,9 @@ Tabelas/views disponiveis:
 
 Schema relevante:
 {schema_text}
+
+Memoria conversacional relevante:
+{memory_context or "Nenhuma memoria conversacional relevante."}
 
 Pergunta:
 {query}
@@ -390,6 +414,7 @@ def answer_universal_sqlite_query(
     llm_model=None,
     progress_callback=None,
     label=None,
+    memory_context=None,
 ):
     conn, path = _connect(db_path)
     if conn is None:
@@ -420,6 +445,7 @@ def answer_universal_sqlite_query(
                     progress_callback=progress_callback,
                     db_path=path,
                     base_name=label,
+                    memory_context=memory_context,
                 )
             except (LIAClientError, json.JSONDecodeError, TypeError, ValueError) as exc:
                 route_info = _fallback_route(query)
@@ -460,6 +486,7 @@ def answer_universal_sqlite_query(
                         progress_callback=progress_callback,
                         db_path=path,
                         base_name=label,
+                        memory_context=memory_context,
                     )
                     agent_evidence.extend(feasibility_evidence)
                 except LIAClientError as exc:
@@ -486,6 +513,7 @@ def answer_universal_sqlite_query(
                             base_name=label,
                             progress_callback=progress_callback,
                         ),
+                        memory_context=memory_context,
                     )
                     agent_evidence.extend(sql_evidence or [])
                 except Exception as exc:

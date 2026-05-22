@@ -3644,6 +3644,7 @@ with main_col:
                     llm_model=final_llm_model,
                     progress_callback=on_timing,
                     label=base,
+                    memory_context=memory_context,
                 )
                 routing["route_source"] = search_route.get("source")
                 routing["route_reason"] = search_route.get("reason")
